@@ -1,58 +1,38 @@
 """
-Agent Loop 核心（Section V.1）：Thought -> Code -> Observation 循环。
-
-这是整个项目的心脏。跑起来大概是这样：
+Agent loop core (Section V.1): Thought -> Code -> Observation.
 
     messages = [system_prompt, user_task]
-    for step in range(max_iterations):
-        llm_response = llm_provider.generate(messages, stop_sequences=[...])
-        extraction = extract_python_code_block(llm_response.text)
+    for step in 1..max_iterations:
+        response    = llm.generate(messages, stop=["<end_code>"])
+        code        = extract_python_code_block(response.text)
+        observation = sandbox.execute(code)       (or a "no code found" message)
+        if final_answer() was called -> return SolutionOutput
+        messages += [assistant: response, user: "Observation: ..."]
 
-        if extraction.code is None:
-            observation = "❌ 没有找到代码块，请用 ```python ... ``` 包裹你的代码"
-        else:
-            observation = sandbox.execute(extraction.code)   # 见 sandbox/executor.py
-            if sandbox.final_answer_called:
-                return build_solution_output(success=True, ...)
-
-        messages.append({"role": "assistant", "content": llm_response.text})
-        messages.append({"role": "user", "content": f"Observation:\n{observation}"})
-
-        # 记得检查 token / 时间限制有没有超（Section VI.1）
-
-=== 你们需要实现的部分（TODO） ===
-1. `build_system_prompt()`：这是全项目最重要的手写内容之一。
-   系统提示词要包含：
-     - 沙盒手册（工具列表，从 MCP server 动态生成，见 sandbox/manual.py）
-     - Thought/Code/Observation 的格式示例
-     - 至少一个完整的"正确推理"示例（few-shot example）
-2. `AgentLoop.run()`：真正的循环逻辑（伪代码已经写在上面的 docstring 里）
-3. 累计 token 计数、判断是否超过 hard limits（Section VI.1），
-   超限时要优雅地终止并返回 error 字段，而不是让程序崩溃
-4. 处理 KeyboardInterrupt / SystemExit（沙盒那边必须让它们正常向上抛，
-   这里的循环也不能吞掉它们）
+STAGE 0 (current): only max_iterations stops the loop.
+  TODO(stage 1): enforce max_input_tokens / max_output_tokens / timeout_seconds.
 """
 from __future__ import annotations
 
 import time
-from typing import List, Optional
+from typing import List
 
-from common.llm_provider import LLMProvider
 from common.code_extraction import extract_python_code_block
+from common.llm_provider import LLMProvider
 from common.models import SolutionOutput, StepMetrics
+
+STOP_SEQUENCES = ["<end_code>"]
 
 
 class AgentLoop:
-    """MBPP 和 SWE-bench 的 agent 都应该复用（或继承）这个类，
-    区别只在于：system prompt 的内容、task 的输入格式、
-    以及 sandbox 连接的是哪个 MCP server（mcp_tools_mbpp.py 还是
-    mcp_tools_swebench.py）。
+    """Shared by the MBPP and SWE-bench agents; only the system prompt,
+    the task text and the sandbox's MCP tools differ.
     """
 
     def __init__(
         self,
         llm_provider: LLMProvider,
-        sandbox,  # sandbox.executor.Sandbox 实例，见 sandbox/executor.py
+        sandbox,  # sandbox.executor.Sandbox
         system_prompt: str,
         max_iterations: int,
         max_input_tokens: int,
@@ -68,29 +48,119 @@ class AgentLoop:
         self.timeout_seconds = timeout_seconds
 
     def run(self, task_id: str, benchmark: str, user_task: str) -> SolutionOutput:
-        """
-        TODO(学生实现): 按上面 docstring 里的伪代码实现完整循环。
+        start = time.perf_counter()
+        messages = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_task},
+        ]
+        steps: List[StepMetrics] = []
 
-        提示：
-        - steps: List[StepMetrics] = [] 用来累积每一步的记录
-        - total_input_tokens / total_output_tokens 累加后要和 hard limit 比较
-        - 循环正常结束（LLM 调用了 final_answer）或者达到 max_iterations /
-          超过 token 限制 / 超时，都要返回一个 SolutionOutput，
-          而不是抛异常让整个程序崩掉
-        """
-        raise NotImplementedError("TODO: 实现 Thought -> Code -> Observation 循环")
+        def finish(success: bool, solution: str, error=None) -> SolutionOutput:
+            return SolutionOutput(
+                task_id=task_id,
+                benchmark=benchmark,
+                success=success,
+                solution=solution,
+                iterations=len(steps),
+                total_requests=sum(1 + s.retries for s in steps),
+                total_input_tokens=sum(s.input_tokens for s in steps),
+                total_output_tokens=sum(s.output_tokens for s in steps),
+                total_time_seconds=time.perf_counter() - start,
+                steps=steps,
+                system_prompt=self.system_prompt,
+                error=error,
+            )
+
+        for step in range(1, self.max_iterations + 1):
+            try:
+                response = self.llm_provider.generate(messages, stop_sequences=STOP_SEQUENCES)
+            except Exception as e:
+                return finish(False, "", f"LLM request failed at step {step}: {e}")
+
+            extraction = extract_python_code_block(response.text)
+            if extraction.code is None:
+                observation = (
+                    "No code block found. Reply with 'Thought: ...' followed by a "
+                    "```python ... ``` block, then <end_code>."
+                )
+            else:
+                observation = self.sandbox.execute(extraction.code) or "(no output — use print())"
+
+            steps.append(
+                StepMetrics(
+                    step=step,
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                    request_time_ms=response.request_time_ms,
+                    api_url=self.llm_provider.base_url,
+                    model_name=self.llm_provider.model_name,
+                    llm_output=response.text,
+                    sandbox_input=extraction.code or "",
+                    sandbox_output=observation,
+                    retries=response.retries,
+                )
+            )
+
+            if self.sandbox.final_answer_called:
+                return finish(True, self.sandbox.final_answer_value)
+
+            messages.append({"role": "assistant", "content": response.text})
+            messages.append({"role": "user", "content": f"Observation:\n{observation}"})
+
+        return finish(False, "", f"Reached max iterations ({self.max_iterations}) without final_answer")
 
 
 def build_system_prompt(sandbox_manual: str, benchmark: str) -> str:
-    """
-    TODO(学生实现): 拼装完整的 system prompt。
+    """STAGE 0: minimal prompt with format rules and one worked example."""
+    tools = sandbox_manual.strip() or "(no extra tools connected)"
+    return f"""You are a coding agent that solves tasks by writing and running Python code.
 
-    必须包含（Section V.1 明确要求）：
-    1. 清晰的工具文档（直接嵌入 sandbox_manual，见 sandbox/manual.py）
-    2. Thought / Code / Observation 的输出格式示例
-    3. 至少一个完整的、有效的推理循环示例（few-shot）
+At each turn, write:
+Thought: your reasoning about what to do next
+```python
+# code to run
+```
+<end_code>
 
-    小技巧：先假装自己是 LLM，手动把这个任务做一遍，
-    你手动做的那个过程，就应该是这份 prompt 里的示例。
-    """
-    raise NotImplementedError("TODO: 编写你的 system prompt 模板")
+Rules:
+- Your code is executed and its printed output is sent back to you as "Observation:".
+  Only what you print() is visible, so print the results you need.
+- Variables and functions you define persist between turns.
+- Never write the Observation yourself; stop after <end_code>.
+- When you are done, call final_answer(answer) inside a code block.
+
+Always available:
+- final_answer(answer: str) -> None : submit your final answer and end the task.
+
+Other tools:
+{tools}
+
+For {benchmark} tasks: write the requested function as a source-code string, exec() it,
+check it against the given tests, then submit the source string with final_answer.
+
+Example
+-------
+Task: Write a function to find the square of a number.
+Function signature: def square(n):
+Tests:
+assert square(3) == 9
+
+Thought: I will define the function as a string, run it and check the test.
+```python
+solution = '''def square(n):
+    return n * n
+'''
+exec(solution)
+assert square(3) == 9
+print("all tests passed")
+```
+<end_code>
+Observation:
+all tests passed
+
+Thought: The tests pass, I submit the solution.
+```python
+final_answer(solution)
+```
+<end_code>
+"""
