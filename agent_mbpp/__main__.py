@@ -1,27 +1,29 @@
 """
-MBPP Agent CLI（Section V.3 第1点）。
+MBPP Agent CLI (Section V.3 point 1).
 
-用法（对照 PDF）：
+Usage:
     uv run python -m agent_mbpp --task-file ../cache/mbpp_task.json \\
         --output ../cache/mbpp_solution.json \\
         --model-name "model/name" --provider-url "https://provider.api/v1"
 
-=== 你们需要实现的部分（TODO） ===
+STAGE 0 (current): no MCP server — the sandbox only has final_answer(),
+and the tests are given to the LLM in the task text.
+  TODO(stage 1): connect mcp_tools_mbpp.py, generate the sandbox manual, enforce limits.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+import time
 
-from common.models import MBPPTaskInput, SandboxConfig, SolutionOutput
-from common.llm_provider import LLMProvider
 from common.agent_loop import AgentLoop, build_system_prompt
+from common.env import load_env_file
+from common.llm_provider import LLMProvider
+from common.models import MBPPTaskInput, SandboxConfig, SolutionOutput
 from sandbox.executor import Sandbox
-from sandbox.mcp_client import MCPClient
-from sandbox.manual import generate_sandbox_manual
 
-# Hard limits — Section VI.1.1
+# Hard limits — Section VI.1.1 (only MAX_ITERATIONS is enforced in stage 0)
 MAX_ITERATIONS = 10
 MAX_INPUT_TOKENS = 6_000
 MAX_OUTPUT_TOKENS = 1_500
@@ -38,26 +40,59 @@ def parse_args(argv=None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def build_user_task(task: MBPPTaskInput) -> str:
+    parts = [
+        f"Task: {task.task_definition}",
+        f"Function signature: {task.function_definition}",
+    ]
+    if task.test_imports:
+        parts.append("Test imports:\n" + "\n".join(task.test_imports))
+    parts.append("Tests:\n" + "\n".join(task.test_list))
+    return "\n".join(parts)
+
+
 def main(argv=None) -> None:
-    """
-    TODO(学生实现):
-    1. 解析参数，读取 task-file，解析成 MBPPTaskInput
-    2. 用 --provider-url --model-name --api-key-env 构造 LLMProvider
-    3. 启动 MCPClient，连接 mcp_tools_mbpp.py（stdio: "python mcp_tools_mbpp.py"）
-    4. discover_tools() + wrap_as_python_functions()，塞进 Sandbox
-    5. generate_sandbox_manual() 生成手册，build_system_prompt() 拼装完整提示词
-    6. 构造 AgentLoop(...)，传入 MAX_ITERATIONS 等 hard limits
-    7. 调用 agent_loop.run(task_id=..., benchmark="mbpp", user_task=...)
-    8. 把返回的 SolutionOutput 写入 --output 指定的 json 文件
-       （记得处理异常——任何崩溃都要被 try/except 兜住，
-       写出 success=False + error 字段，而不是让程序直接崩溃）
-    """
     args = parse_args(argv)
+    load_env_file(".env")
+    start = time.perf_counter()
+    task_id = "unknown"
 
-    with open(args.task_file) as f:
-        task = MBPPTaskInput(**json.load(f))
+    try:
+        with open(args.task_file, encoding="utf-8") as f:
+            task = MBPPTaskInput(**json.load(f))
+        task_id = str(task.task_id)
 
-    raise NotImplementedError("TODO: 按上面的步骤实现 main()")
+        provider = LLMProvider(args.model_name, args.provider_url, args.api_key_env)
+        sandbox = Sandbox(config=SandboxConfig())
+        system_prompt = build_system_prompt(sandbox_manual="", benchmark="mbpp")
+
+        agent = AgentLoop(
+            llm_provider=provider,
+            sandbox=sandbox,
+            system_prompt=system_prompt,
+            max_iterations=MAX_ITERATIONS,
+            max_input_tokens=MAX_INPUT_TOKENS,
+            max_output_tokens=MAX_OUTPUT_TOKENS,
+            timeout_seconds=TIMEOUT_SECONDS,
+        )
+        result = agent.run(task_id=task_id, benchmark="mbpp", user_task=build_user_task(task))
+    except Exception as e:
+        result = SolutionOutput(
+            task_id=task_id,
+            benchmark="mbpp",
+            success=False,
+            solution="",
+            iterations=0,
+            total_requests=0,
+            total_input_tokens=0,
+            total_output_tokens=0,
+            total_time_seconds=time.perf_counter() - start,
+            error=f"{type(e).__name__}: {e}",
+        )
+
+    with open(args.output, "w", encoding="utf-8") as f:
+        f.write(result.model_dump_json(indent=2))
+    print(f"success={result.success} iterations={result.iterations} error={result.error}")
 
 
 if __name__ == "__main__":

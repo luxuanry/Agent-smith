@@ -1,26 +1,19 @@
 """
-LLM Provider 抽象层。
+LLM Provider abstraction.
 
-目标：Agent Loop 不应该关心「我用的是 OpenRouter 还是 Groq 还是 Gemini」，
-它只应该调用 `provider.generate(messages, stop_sequences=[...])`，
-拿到统一格式的返回值。
+The agent loop only calls `provider.generate(messages, stop_sequences=[...])`
+and gets back an `LLMResponse`; it doesn't care which provider is behind it.
 
-=== 你们需要实现的部分（TODO） ===
-1. `LLMProvider.generate()`：真正发 HTTP 请求给 provider（大部分免费 provider
-   都兼容 OpenAI 的 /chat/completions 格式，可以复用同一套请求逻辑）。
-2. 多 API key 轮换：如果一个 key 被限流（HTTP 429），自动换下一个 key 重试。
-3. 记录 usage：每次请求后，把 input_tokens / output_tokens / 耗时 记下来，
-   这些数据最后要填进 StepMetrics。
-4. stop_sequences：见 PDF Section V.6 —— 一定要传 stop 参数，防止模型
-   在你还没执行代码之前就自己"编造"执行结果。
+STAGE 0 (current): one OpenAI-compatible /chat/completions call,
+naive key rotation on 429/5xx. No provider fallback yet.
 
-不要在代码里硬编码 API key！一定从环境变量读（评审会检查，见 Section VI.3）。
+Never hardcode API keys — they are read from an environment variable (Section VI.3).
 """
 from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 import requests
@@ -28,7 +21,7 @@ import requests
 
 @dataclass
 class LLMResponse:
-    """一次 LLM 调用的标准化返回结果。"""
+    """Normalized result of one LLM call."""
 
     text: str
     input_tokens: int
@@ -38,9 +31,9 @@ class LLMResponse:
 
 
 class LLMProvider:
-    """对接一个 OpenAI-兼容的 LLM API（OpenRouter / Groq / 等）。
+    """Talks to any OpenAI-compatible API (OpenRouter / Groq / ...).
 
-    多个 API key 用逗号分隔存在同一个环境变量里，比如：
+    Several keys can be stored comma-separated in one env var:
         OPENROUTER_API_KEY=key1,key2,key3
     """
 
@@ -51,8 +44,8 @@ class LLMProvider:
         self.api_keys: List[str] = [k.strip() for k in raw_keys.split(",") if k.strip()]
         if not self.api_keys:
             raise ValueError(
-                f"没有在环境变量 {api_key_env} 里找到任何 API key。"
-                f" 请检查 .env 文件或环境变量是否设置。"
+                f"No API key found in environment variable {api_key_env}. "
+                f"Check your .env file."
             )
         self._key_index = 0
 
@@ -69,16 +62,44 @@ class LLMProvider:
         max_tokens: int = 1024,
         max_retries: int = 3,
     ) -> LLMResponse:
-        """
-        TODO(学生实现):
-        - 用 requests.post 调用 f"{self.base_url}/chat/completions"
-        - headers 里带 Authorization: Bearer {self._current_key()}
-        - 遇到 429 / 5xx：调用 self._rotate_key()，sleep 一下，重试
-        - 从 response.json() 里解析出:
-            text = response["choices"][0]["message"]["content"]
-            input_tokens = response["usage"]["prompt_tokens"]
-            output_tokens = response["usage"]["completion_tokens"]
-        - 记录 request_time_ms（用 time.perf_counter() 前后差）
-        - 记录 retries 次数
-        """
-        raise NotImplementedError("TODO: 在这里实现真正的 API 调用逻辑")
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+        }
+        if stop_sequences:
+            payload["stop"] = stop_sequences
+
+        retries = 0
+        start = time.perf_counter()
+        while True:
+            response = requests.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self._current_key()}"},
+                json=payload,
+                timeout=120,
+            )
+            # Rate limited or server error: switch key, wait a bit, try again.
+            if response.status_code == 429 or response.status_code >= 500:
+                if retries < max_retries:
+                    retries += 1
+                    self._rotate_key()
+                    time.sleep(2 * retries)
+                    continue
+            if not response.ok:
+                # Include the body: providers explain the real cause there (e.g. unknown model).
+                raise RuntimeError(
+                    f"HTTP {response.status_code} from {response.url}: {response.text[:500]}"
+                )
+            break
+
+        data = response.json()
+        usage = data.get("usage") or {}
+        return LLMResponse(
+            text=data["choices"][0]["message"]["content"] or "",
+            input_tokens=usage.get("prompt_tokens", 0),
+            output_tokens=usage.get("completion_tokens", 0),
+            request_time_ms=(time.perf_counter() - start) * 1000,
+            retries=retries,
+        )
