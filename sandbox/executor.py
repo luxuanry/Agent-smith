@@ -8,16 +8,18 @@ Responsibilities:
   2. execute(code) -> str : run code, capture stdout (the LLM only sees what it print()s)
   3. run_repl() : interactive mode for `uv run sandbox`
 
-STAGE 2 (current): security.py is wired in.
-  - import allowlist (ImportGuard)
+STAGE 3 (current): security.py is fully wired in.
+  - import allowlist (ImportGuard) -- also the mechanism that blocks network
+    access, since socket/urllib/http/etc. are simply never on the allowlist
   - restricted builtins, `open` checked against allowed_directories
   - timeout via signal.alarm
-  TODO(stage 3): memory limit (resource.setrlimit), no network.
+  - memory limit via resource.setrlimit(RLIMIT_AS, ...)
 """
 from __future__ import annotations
 
 import contextlib
 import io
+import resource
 import signal
 import traceback
 from typing import Any, Callable, Dict, Optional
@@ -59,6 +61,18 @@ class Sandbox:
         self._import_guard.install()
         previous_handler = signal.signal(signal.SIGALRM, self._timeout_handler)
         signal.alarm(self.config.max_execution_time_seconds)
+
+        previous_soft, hard_limit = resource.getrlimit(resource.RLIMIT_AS)
+        max_bytes = self.config.max_memory_mb * 1024 * 1024
+        try:
+            # Cap the process's total address space. Only lower the soft limit
+            # (never raise it above the existing hard limit) -- raising a hard
+            # limit back up after usually requires elevated privileges.
+            new_soft = max_bytes if hard_limit == resource.RLIM_INFINITY else min(max_bytes, hard_limit)
+            resource.setrlimit(resource.RLIMIT_AS, (new_soft, hard_limit))
+        except (ValueError, OSError):
+            pass  # some platforms silently ignore or reject RLIMIT_AS
+
         try:
             with contextlib.redirect_stdout(stdout_buffer):
                 exec(code, self.namespace)
@@ -66,6 +80,11 @@ class Sandbox:
             raise  # must reach the agent loop, never swallow these
         except TimeoutError as e:
             return stdout_buffer.getvalue() + f"[TIMEOUT] {e}"
+        except MemoryError:
+            return (
+                stdout_buffer.getvalue()
+                + f"[MEMORY LIMIT] Execution exceeded {self.config.max_memory_mb}MB and was stopped"
+            )
         except Exception:
             # Keep the partial output, then show the error so the LLM can fix its code.
             return stdout_buffer.getvalue() + traceback.format_exc(limit=-1)
@@ -73,6 +92,10 @@ class Sandbox:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, previous_handler)
             self._import_guard.uninstall()
+            try:
+                resource.setrlimit(resource.RLIMIT_AS, (previous_soft, hard_limit))
+            except (ValueError, OSError):
+                pass
         return stdout_buffer.getvalue()
 
     def run_repl(self) -> None:
