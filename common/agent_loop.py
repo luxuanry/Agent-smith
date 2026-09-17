@@ -9,8 +9,10 @@ Agent loop core (Section V.1): Thought -> Code -> Observation.
         if final_answer() was called -> return SolutionOutput
         messages += [assistant: response, user: "Observation: ..."]
 
-STAGE 0 (current): only max_iterations stops the loop.
-  TODO(stage 1): enforce max_input_tokens / max_output_tokens / timeout_seconds.
+STAGE 1 (current): max_iterations, max_input_tokens, max_output_tokens and
+  timeout_seconds are all enforced. Token limits are cumulative across all
+  iterations of the task (Section VI.1); timeout is checked before starting
+  each new LLM call, not mid-request.
 """
 from __future__ import annotations
 
@@ -71,11 +73,21 @@ class AgentLoop:
                 error=error,
             )
 
+        total_input_tokens = 0
+        total_output_tokens = 0
+
         for step in range(1, self.max_iterations + 1):
+            elapsed = time.perf_counter() - start
+            if elapsed >= self.timeout_seconds:
+                return finish(False, "", f"Reached timeout ({self.timeout_seconds}s) before completing")
+
             try:
                 response = self.llm_provider.generate(messages, stop_sequences=STOP_SEQUENCES)
             except Exception as e:
                 return finish(False, "", f"LLM request failed at step {step}: {e}")
+
+            total_input_tokens += response.input_tokens
+            total_output_tokens += response.output_tokens
 
             extraction = extract_python_code_block(response.text)
             if extraction.code is None:
@@ -102,7 +114,15 @@ class AgentLoop:
             )
 
             if self.sandbox.final_answer_called:
+                # A successful final_answer on this very step counts as success even
+                # if this step's tokens happen to push the running total over budget --
+                # the totals were only knowable after the response that solved the task.
                 return finish(True, self.sandbox.final_answer_value)
+
+            if total_input_tokens > self.max_input_tokens:
+                return finish(False, "", f"Exceeded max input tokens ({self.max_input_tokens})")
+            if total_output_tokens > self.max_output_tokens:
+                return finish(False, "", f"Exceeded max output tokens ({self.max_output_tokens})")
 
             messages.append({"role": "assistant", "content": response.text})
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
