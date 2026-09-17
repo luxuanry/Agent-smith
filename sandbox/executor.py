@@ -8,18 +8,22 @@ Responsibilities:
   2. execute(code) -> str : run code, capture stdout (the LLM only sees what it print()s)
   3. run_repl() : interactive mode for `uv run sandbox`
 
-STAGE 0 (current): plain exec() in-process, NO security at all.
-  TODO(stage 2): import allowlist, restricted builtins, path allowlist,
-                 timeout, memory limit, no network (see sandbox/security.py).
+STAGE 2 (current): security.py is wired in.
+  - import allowlist (ImportGuard)
+  - restricted builtins, `open` checked against allowed_directories
+  - timeout via signal.alarm
+  TODO(stage 3): memory limit (resource.setrlimit), no network.
 """
 from __future__ import annotations
 
 import contextlib
 import io
+import signal
 import traceback
 from typing import Any, Callable, Dict, Optional
 
 from common.models import SandboxConfig
+from sandbox.security import ImportGuard, build_restricted_builtins
 
 
 class Sandbox:
@@ -29,6 +33,7 @@ class Sandbox:
         self.final_answer_value: Optional[str] = None
         self.final_answer_called: bool = False
         self.namespace: Dict[str, Any] = {}
+        self._import_guard = ImportGuard(config.authorized_imports)
         self._setup_namespace()
 
     def _final_answer(self, answer: str) -> None:
@@ -39,18 +44,35 @@ class Sandbox:
     def _setup_namespace(self) -> None:
         self.namespace["final_answer"] = self._final_answer
         self.namespace.update(self.mcp_tools)
+        restricted_builtins = build_restricted_builtins(self.config.allowed_directories)
+        restricted_builtins["__import__"] = self._import_guard.guarded_import
+        self.namespace["__builtins__"] = restricted_builtins
+
+    def _timeout_handler(self, signum, frame) -> None:
+        raise TimeoutError(
+            f"Execution exceeded {self.config.max_execution_time_seconds}s and was terminated"
+        )
 
     def execute(self, code: str) -> str:
         """Run `code` in the shared namespace and return what it printed (or the error)."""
         stdout_buffer = io.StringIO()
+        self._import_guard.install()
+        previous_handler = signal.signal(signal.SIGALRM, self._timeout_handler)
+        signal.alarm(self.config.max_execution_time_seconds)
         try:
             with contextlib.redirect_stdout(stdout_buffer):
                 exec(code, self.namespace)
         except (KeyboardInterrupt, SystemExit):
             raise  # must reach the agent loop, never swallow these
+        except TimeoutError as e:
+            return stdout_buffer.getvalue() + f"[TIMEOUT] {e}"
         except Exception:
             # Keep the partial output, then show the error so the LLM can fix its code.
             return stdout_buffer.getvalue() + traceback.format_exc(limit=-1)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous_handler)
+            self._import_guard.uninstall()
         return stdout_buffer.getvalue()
 
     def run_repl(self) -> None:
