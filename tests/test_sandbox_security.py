@@ -24,7 +24,14 @@ def sandbox():
         max_execution_time_seconds=2,
         max_memory_mb=128,
     )
-    return Sandbox(config=config)
+    sb = Sandbox(config=config)
+    yield sb
+    # STAGE 4: each Sandbox now owns a live worker process (see
+    # sandbox/executor.py). Shut it down explicitly after each test so a
+    # full test run doesn't accumulate orphaned processes while it's going
+    # -- Sandbox.__del__ would eventually catch it, but GC timing isn't
+    # something to rely on across dozens of tests.
+    sb.shutdown()
 
 
 def test_allowed_import_works(sandbox):

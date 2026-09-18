@@ -4,8 +4,9 @@ Sandbox security (Section V.2 points 3, 4).
 Four things the sandbox has to hold up under `tests/test_sandbox_security.py`:
   1. import allowlist    -- only whitelisted modules can be imported
   2. path allowlist       -- file access restricted to allowed_directories
-  3. timeout               -- handled in sandbox/executor.py, not here
-  4. memory limit          -- handled in sandbox/executor.py, not here
+  3. timeout               -- enforced by killing the worker process (executor.py)
+  4. memory limit          -- resource.setrlimit, applied here, called once when
+                              the worker process starts (executor.py)
 
 Only the standard library is used here (no third-party sandboxing libs).
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import builtins
 import os
+import resource
 from typing import Iterable, Set
 
 
@@ -68,12 +70,16 @@ def build_restricted_builtins(allowed_directories: Iterable[str]) -> dict:
     """A copy of the normal builtins, with the dangerous ones removed or wrapped.
 
     - `open` is replaced with a version that checks the path first.
-    - `eval` / `exec` / `compile` / `__import__` are removed: the sandbox itself
-      needs `exec` to run the LLM's code once, but the LLM's code should not be
-      able to call `exec`/`eval` again from inside to route around the guards
-      above (`ImportGuard` already covers plain `import` statements).
+    - `eval` / `exec` / `compile` are removed: the sandbox itself needs `exec`
+      to run the LLM's code once, but the LLM's code should not be able to
+      call `exec`/`eval` again from inside to route around the guards above
+      (`ImportGuard` already covers plain `import` statements).
     - `input` / `breakpoint` are removed: no interactive prompts from inside
       untrusted code.
+    - `__import__` is intentionally left in place here; the caller (the
+      sandbox worker) overwrites it with the ImportGuard's guarded version.
+      The import statement needs *some* callable named __import__ to exist
+      in builtins, so removing it outright breaks even whitelisted imports.
     """
     safe_builtins = dict(vars(builtins))
     real_open = builtins.open
@@ -85,11 +91,34 @@ def build_restricted_builtins(allowed_directories: Iterable[str]) -> dict:
 
     safe_builtins["open"] = guarded_open
 
-    # __import__ is intentionally left in place here; Sandbox._setup_namespace
-    # overwrites it with the ImportGuard's guarded version. The import
-    # statement needs *some* callable named __import__ to exist in builtins,
-    # so removing it outright breaks even whitelisted imports.
     for name in ("eval", "exec", "compile", "input", "breakpoint"):
         safe_builtins.pop(name, None)
 
     return safe_builtins
+
+
+def apply_memory_limit(max_memory_mb: int) -> None:
+    """Cap this process's total address space. Call once, right when the
+    sandbox worker process starts, before any user code runs -- never in
+    the parent/agent process (that would cap the whole agent, not just the
+    sandboxed code).
+
+    KNOWN LIMITATION: RLIMIT_AS is enforced reliably by the Linux kernel,
+    but is loosely enforced by the macOS (Darwin/XNU) kernel -- on Mac this
+    is a best-effort cap, not a guarantee. What still holds on Mac even if
+    this doesn't fire: since the sandboxed code now runs in its own worker
+    process (sandbox/executor.py), if the OS ends up OOM-killing that
+    process anyway, only the worker dies -- the agent loop and the rest of
+    the program keep running, and the crash is reported back as an
+    observation instead of taking the whole run down.
+    """
+    if max_memory_mb <= 0:
+        return  # 0 or negative means "no limit" -- don't call setrlimit(0)
+    limit_bytes = max_memory_mb * 1024 * 1024
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+    except (ValueError, OSError):
+        # Some platforms/containers refuse to lower RLIMIT_AS at all.
+        # Don't crash the worker over it -- the process-level isolation
+        # (killable/OOM-killable independently of the parent) still holds.
+        pass
