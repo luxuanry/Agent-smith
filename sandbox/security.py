@@ -98,10 +98,13 @@ def build_restricted_builtins(allowed_directories: Iterable[str]) -> dict:
 
 
 def apply_memory_limit(max_memory_mb: int) -> None:
-    """Cap this process's total address space. Call once, right when the
-    sandbox worker process starts, before any user code runs -- never in
-    the parent/agent process (that would cap the whole agent, not just the
-    sandboxed code).
+    """Cap this process's total address space by lowering the SOFT
+    RLIMIT_AS only -- the hard limit is left untouched (usually
+    RLIM_INFINITY), specifically so a later `reset_memory_limit()` call can
+    raise the soft limit back up. Call this around the one thing that
+    actually needs capping (the worker's `exec(code, namespace)` call, see
+    sandbox/executor.py) -- never in the parent/agent process, and never
+    left on permanently in the worker (see reset_memory_limit below for why).
 
     KNOWN LIMITATION: RLIMIT_AS is enforced reliably by the Linux kernel,
     but is loosely enforced by the macOS (Darwin/XNU) kernel -- on Mac this
@@ -116,9 +119,35 @@ def apply_memory_limit(max_memory_mb: int) -> None:
         return  # 0 or negative means "no limit" -- don't call setrlimit(0)
     limit_bytes = max_memory_mb * 1024 * 1024
     try:
-        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        new_soft = limit_bytes if hard == resource.RLIM_INFINITY else min(limit_bytes, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (new_soft, hard))
     except (ValueError, OSError):
         # Some platforms/containers refuse to lower RLIMIT_AS at all.
         # Don't crash the worker over it -- the process-level isolation
         # (killable/OOM-killable independently of the parent) still holds.
+        pass
+
+
+def reset_memory_limit() -> None:
+    """Undo apply_memory_limit(): raise the soft RLIMIT_AS back up to the
+    (untouched) hard limit -- usually RLIM_INFINITY, i.e. no cap.
+
+    Why this exists: a tight memory cap (e.g. 128MB in tests) is barely
+    enough headroom for the user's own code, let alone the worker's OWN
+    bookkeeping between calls -- notably, `multiprocessing.Queue.put()`
+    lazily starts a background feeder thread on its first use, which needs
+    to mmap a new thread stack. On a real Linux kernel (which -- unlike
+    macOS -- actually enforces RLIMIT_AS) a fresh, fully-loaded, forked
+    CPython process can already be sitting close to a tight cap, and that
+    mmap fails with "RuntimeError: can't start new thread" -- not because
+    anything is actually leaking or wrong, just because the cap meant for
+    the sandboxed code was still in effect for the worker's own plumbing.
+    Calling this right after exec() finishes, before touching the result
+    queue, keeps the cap scoped to exactly the code it's meant to constrain.
+    """
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+    except (ValueError, OSError):
         pass
