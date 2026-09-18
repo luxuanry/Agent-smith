@@ -24,10 +24,22 @@ being exec()'d directly inside the agent's own process. Why this changed:
     agent_swebench run. Before, a crash inside exec() could kill the
     entire agent process (or worse, corrupt its state without killing it).
   - Memory limit is now TWO layers instead of one:
-      1. security.apply_memory_limit(), applied once inside the child right
-         when it starts (RLIMIT_AS). Reliable on Linux, loosely enforced by
-         the macOS kernel -- confirmed by tests/test_sandbox_security.py,
-         which fails on macOS without layer 2 below.
+      1. security.apply_memory_limit()/reset_memory_limit() (RLIMIT_AS),
+         applied ONLY around the exec(code, namespace) call inside the
+         worker's loop -- not for the worker's whole lifetime. Reliable on
+         Linux, loosely enforced by the macOS kernel. IMPORTANT: this used
+         to be applied once at worker startup and left on permanently,
+         which caused a real bug on Linux (never showed up on macOS, since
+         macOS doesn't enforce RLIMIT_AS anyway): a forked, fully-loaded
+         CPython worker can already be using a good chunk of a tight limit
+         (e.g. 128MB in tests) just from its own imports, so when
+         result_queue.put() lazily starts its internal feeder thread after
+         exec() finishes, the mmap for that thread's stack could fail with
+         "RuntimeError: can't start new thread" -- nothing was actually
+         leaking, the cap meant for the user's code was just still active
+         for the worker's own plumbing. Now the cap is applied right before
+         exec() and lifted right after, so it never constrains anything
+         except the code it's meant to constrain.
       2. An RSS watchdog in the PARENT: execute()'s polling loop (already
          running every _POLL_INTERVAL_SECONDS to check for a result/crash)
          also shells out to `ps -o rss= -p <pid>` to read the worker's
@@ -75,7 +87,7 @@ import traceback
 from typing import Any, Callable, Dict, Optional
 
 from common.models import SandboxConfig
-from sandbox.security import ImportGuard, apply_memory_limit, build_restricted_builtins
+from sandbox.security import ImportGuard, apply_memory_limit, build_restricted_builtins, reset_memory_limit
 
 # How often the parent polls for a result while waiting on a call. Small
 # enough that a dead worker (crash/OOM) is noticed well before the full
@@ -126,8 +138,10 @@ def _worker_main(
     import contextlib
     import io
 
-    apply_memory_limit(config.max_memory_mb)
-
+    # NOTE: the memory cap is intentionally NOT applied here. It's scoped
+    # to just the exec() call below instead -- see the module docstring's
+    # "Memory limit" section for why applying it for the worker's whole
+    # lifetime caused a real bug on Linux.
     namespace: Dict[str, Any] = {}
     final_answer_state: Dict[str, Any] = {"called": False, "value": None}
 
@@ -155,6 +169,7 @@ def _worker_main(
         stdout_buffer = io.StringIO()
         error: Optional[str] = None
         import_guard.install()
+        apply_memory_limit(config.max_memory_mb)
         try:
             with contextlib.redirect_stdout(stdout_buffer):
                 exec(code, namespace)
@@ -167,6 +182,11 @@ def _worker_main(
             error = traceback.format_exc(limit=-1)
         finally:
             import_guard.uninstall()
+            # Lift the memory cap before touching result_queue.put() below,
+            # which may need to start its own background thread the first
+            # time it's called -- that shouldn't be squeezed by a limit
+            # meant only for the code that just ran.
+            reset_memory_limit()
 
         result_queue.put(
             {
