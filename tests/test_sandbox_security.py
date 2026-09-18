@@ -53,4 +53,20 @@ def test_final_answer_sets_flag(sandbox):
     assert sandbox.final_answer_value == "done"
 
 
-# TODO: 加更多测试 —— network block / memory limit / MCP协议相关
+def test_network_import_is_blocked(sandbox):
+    # socket/urllib/http.client are simply never on the authorized_imports
+    # allowlist, so the same ImportGuard that blocks `os` blocks these too.
+    for module in ("socket", "urllib.request", "http.client"):
+        output = sandbox.execute(f"import {module}\nprint('reached')")
+        assert "ImportError" in output or "not authorized" in output.lower()
+        assert "reached" not in output
+
+
+def test_memory_limit_is_enforced(sandbox):
+    # sandbox fixture caps max_memory_mb at 128; try to grab ~400MB in one shot.
+    output = sandbox.execute("x = bytearray(400 * 1024 * 1024)\nprint('reached')")
+    assert "memory" in output.lower()
+    assert "reached" not in output
+
+
+# TODO: MCP 协议相关的测试，等 mcp_client.py / mcp_tools_mbpp.py 写完之后再补

@@ -1,45 +1,61 @@
 """
-沙盒安全机制（Section V.2 第3、4点）。
+Sandbox security (Section V.2 points 3, 4).
 
-这是整个项目里"安全 review"会重点检查的部分。四个维度：
-  1. import 限制 —— 只有白名单里的模块能被 import
-  2. 文件路径限制 —— 只能访问 allowed_directories 里的路径
-  3. 执行超时 —— 用 signal.alarm 或者子进程 + timeout
-  4. 内存限制 —— 用 resource.setrlimit(RLIMIT_AS, ...)（仅 Unix）
+Four things the sandbox has to hold up under `tests/test_sandbox_security.py`:
+  1. import allowlist    -- only whitelisted modules can be imported
+  2. path allowlist       -- file access restricted to allowed_directories
+  3. timeout               -- handled in sandbox/executor.py, not here
+  4. memory limit          -- handled in sandbox/executor.py, not here
 
-只能用标准库实现（PDF 明确禁止 RestrictedPython 等第三方库）。
-
-=== 你们需要实现的部分（TODO） ===
+Only the standard library is used here (no third-party sandboxing libs).
 """
 from __future__ import annotations
 
 import builtins
+import os
 from typing import Iterable, Set
 
 
+def check_path_allowed(path: str, allowed_directories: Iterable[str]) -> bool:
+    """True if `path` resolves to somewhere inside one of `allowed_directories`.
+
+    `os.path.realpath` collapses `..`, symlinks and relative segments into a
+    clean absolute path first, so a trick like "/testbed/../../etc/passwd"
+    can't sneak past the string comparison below.
+    """
+    real_path = os.path.realpath(path)
+    for allowed in allowed_directories:
+        real_allowed = os.path.realpath(allowed)
+        if real_path == real_allowed or real_path.startswith(real_allowed + os.sep):
+            return True
+    return False
+
+
 class ImportGuard:
-    """拦截 __import__，只放行白名单里的模块。"""
+    """Intercepts `__import__`, only letting whitelisted modules through.
+
+    `authorized_imports` entries can be an exact module name ("math") or a
+    wildcard covering all of a package's submodules ("math.*").
+    """
 
     def __init__(self, authorized_imports: Iterable[str]):
         self.authorized: Set[str] = set(authorized_imports)
         self._real_import = builtins.__import__
 
     def _is_authorized(self, module_name: str) -> bool:
-        """
-        TODO(学生实现): 判断 module_name 是否在白名单里。
-        注意 authorized_imports 里可能有 "math.*" 这种通配符写法，
-        代表 math 的所有子模块都允许，需要自己处理这个匹配逻辑。
-        """
-        raise NotImplementedError
+        if module_name in self.authorized:
+            return True
+        top_level = module_name.split(".")[0]
+        if top_level in self.authorized:
+            return True
+        if f"{top_level}.*" in self.authorized:
+            return True
+        return False
 
     def guarded_import(self, name, globals=None, locals=None, fromlist=(), level=0):
-        """
-        TODO(学生实现):
-        - 如果 self._is_authorized(name) 为 False，抛出 ImportError，
-          并给出清晰的错误信息（例如 "模块 'os' 不在白名单内"）
-        - 否则调用 self._real_import(...) 正常导入
-        """
-        raise NotImplementedError
+        if not self._is_authorized(name):
+            raise ImportError(f"Module '{name}' is not in the authorized imports allowlist")
+        return self._real_import(name, globals, locals, fromlist, level)
 
     def install(self) -> None:
         builtins.__import__ = self.guarded_import
@@ -48,28 +64,32 @@ class ImportGuard:
         builtins.__import__ = self._real_import
 
 
-def build_restricted_builtins() -> dict:
-    """
-    TODO(学生实现): 返回一份"安全"的 builtins 字典，
-    去掉或者重写危险的内置函数，例如：
-      - eval / exec 本身要不要放开？（沙盒本身要用 exec 执行代码，
-        但不代表要把 exec 暴露给"沙盒里的代码"再去嵌套调用）
-      - open() 需要包一层，检查路径是否在 allowed_directories 内
-      - __import__ 由上面的 ImportGuard 接管
-      - os / sys / subprocess 等模块本身不在白名单里，自然就 import 不了，
-        但要想清楚：如果某个已经 import 好的模块间接暴露了这些能力，
-        要不要也拦截？
+def build_restricted_builtins(allowed_directories: Iterable[str]) -> dict:
+    """A copy of the normal builtins, with the dangerous ones removed or wrapped.
 
-    思路提示（Section V.2 的"Think about it"框）：
-    考虑清楚未受信任的代码到底应该跑在你的主进程里，还是单独的子进程/线程里，
-    这会决定你在这里要做多少防御，以及超时怎么真正"杀死"一段跑飞的代码。
+    - `open` is replaced with a version that checks the path first.
+    - `eval` / `exec` / `compile` / `__import__` are removed: the sandbox itself
+      needs `exec` to run the LLM's code once, but the LLM's code should not be
+      able to call `exec`/`eval` again from inside to route around the guards
+      above (`ImportGuard` already covers plain `import` statements).
+    - `input` / `breakpoint` are removed: no interactive prompts from inside
+      untrusted code.
     """
-    raise NotImplementedError
+    safe_builtins = dict(vars(builtins))
+    real_open = builtins.open
 
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if not check_path_allowed(str(file), allowed_directories):
+            raise PermissionError(f"Access to path '{file}' is not allowed")
+        return real_open(file, mode, *args, **kwargs)
 
-def check_path_allowed(path: str, allowed_directories: Iterable[str]) -> bool:
-    """
-    TODO(学生实现): 判断 path 是否落在 allowed_directories 中的某一个目录内。
-    注意处理 ../ 这种路径穿越攻击 —— 用 os.path.realpath() 规范化之后再比较。
-    """
-    raise NotImplementedError
+    safe_builtins["open"] = guarded_open
+
+    # __import__ is intentionally left in place here; Sandbox._setup_namespace
+    # overwrites it with the ImportGuard's guarded version. The import
+    # statement needs *some* callable named __import__ to exist in builtins,
+    # so removing it outright breaks even whitelisted imports.
+    for name in ("eval", "exec", "compile", "input", "breakpoint"):
+        safe_builtins.pop(name, None)
+
+    return safe_builtins
