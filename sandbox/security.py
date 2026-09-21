@@ -1,45 +1,63 @@
 """
-沙盒安全机制（Section V.2 第3、4点）。
+Sandbox security (Section V.2 points 3, 4).
 
-这是整个项目里"安全 review"会重点检查的部分。四个维度：
-  1. import 限制 —— 只有白名单里的模块能被 import
-  2. 文件路径限制 —— 只能访问 allowed_directories 里的路径
-  3. 执行超时 —— 用 signal.alarm 或者子进程 + timeout
-  4. 内存限制 —— 用 resource.setrlimit(RLIMIT_AS, ...)（仅 Unix）
+Four things the sandbox has to hold up under `tests/test_sandbox_security.py`:
+  1. import allowlist    -- only whitelisted modules can be imported
+  2. path allowlist       -- file access restricted to allowed_directories
+  3. timeout               -- enforced by killing the worker process (executor.py)
+  4. memory limit          -- resource.setrlimit, applied here, called once when
+                              the worker process starts (executor.py)
 
-只能用标准库实现（PDF 明确禁止 RestrictedPython 等第三方库）。
-
-=== 你们需要实现的部分（TODO） ===
+Only the standard library is used here (no third-party sandboxing libs).
 """
 from __future__ import annotations
 
 import builtins
+import os
+import resource
 from typing import Iterable, Set
 
 
+def check_path_allowed(path: str, allowed_directories: Iterable[str]) -> bool:
+    """True if `path` resolves to somewhere inside one of `allowed_directories`.
+
+    `os.path.realpath` collapses `..`, symlinks and relative segments into a
+    clean absolute path first, so a trick like "/testbed/../../etc/passwd"
+    can't sneak past the string comparison below.
+    """
+    real_path = os.path.realpath(path)
+    for allowed in allowed_directories:
+        real_allowed = os.path.realpath(allowed)
+        if real_path == real_allowed or real_path.startswith(real_allowed + os.sep):
+            return True
+    return False
+
+
 class ImportGuard:
-    """拦截 __import__，只放行白名单里的模块。"""
+    """Intercepts `__import__`, only letting whitelisted modules through.
+
+    `authorized_imports` entries can be an exact module name ("math") or a
+    wildcard covering all of a package's submodules ("math.*").
+    """
 
     def __init__(self, authorized_imports: Iterable[str]):
         self.authorized: Set[str] = set(authorized_imports)
         self._real_import = builtins.__import__
 
     def _is_authorized(self, module_name: str) -> bool:
-        """
-        TODO(学生实现): 判断 module_name 是否在白名单里。
-        注意 authorized_imports 里可能有 "math.*" 这种通配符写法，
-        代表 math 的所有子模块都允许，需要自己处理这个匹配逻辑。
-        """
-        raise NotImplementedError
+        if module_name in self.authorized:
+            return True
+        top_level = module_name.split(".")[0]
+        if top_level in self.authorized:
+            return True
+        if f"{top_level}.*" in self.authorized:
+            return True
+        return False
 
     def guarded_import(self, name, globals=None, locals=None, fromlist=(), level=0):
-        """
-        TODO(学生实现):
-        - 如果 self._is_authorized(name) 为 False，抛出 ImportError，
-          并给出清晰的错误信息（例如 "模块 'os' 不在白名单内"）
-        - 否则调用 self._real_import(...) 正常导入
-        """
-        raise NotImplementedError
+        if not self._is_authorized(name):
+            raise ImportError(f"Module '{name}' is not in the authorized imports allowlist")
+        return self._real_import(name, globals, locals, fromlist, level)
 
     def install(self) -> None:
         builtins.__import__ = self.guarded_import
@@ -48,28 +66,88 @@ class ImportGuard:
         builtins.__import__ = self._real_import
 
 
-def build_restricted_builtins() -> dict:
-    """
-    TODO(学生实现): 返回一份"安全"的 builtins 字典，
-    去掉或者重写危险的内置函数，例如：
-      - eval / exec 本身要不要放开？（沙盒本身要用 exec 执行代码，
-        但不代表要把 exec 暴露给"沙盒里的代码"再去嵌套调用）
-      - open() 需要包一层，检查路径是否在 allowed_directories 内
-      - __import__ 由上面的 ImportGuard 接管
-      - os / sys / subprocess 等模块本身不在白名单里，自然就 import 不了，
-        但要想清楚：如果某个已经 import 好的模块间接暴露了这些能力，
-        要不要也拦截？
+def build_restricted_builtins(allowed_directories: Iterable[str]) -> dict:
+    """A copy of the normal builtins, with the dangerous ones removed or wrapped.
 
-    思路提示（Section V.2 的"Think about it"框）：
-    考虑清楚未受信任的代码到底应该跑在你的主进程里，还是单独的子进程/线程里，
-    这会决定你在这里要做多少防御，以及超时怎么真正"杀死"一段跑飞的代码。
+    - `open` is replaced with a version that checks the path first.
+    - `eval` / `exec` / `compile` are removed: the sandbox itself needs `exec`
+      to run the LLM's code once, but the LLM's code should not be able to
+      call `exec`/`eval` again from inside to route around the guards above
+      (`ImportGuard` already covers plain `import` statements).
+    - `input` / `breakpoint` are removed: no interactive prompts from inside
+      untrusted code.
+    - `__import__` is intentionally left in place here; the caller (the
+      sandbox worker) overwrites it with the ImportGuard's guarded version.
+      The import statement needs *some* callable named __import__ to exist
+      in builtins, so removing it outright breaks even whitelisted imports.
     """
-    raise NotImplementedError
+    safe_builtins = dict(vars(builtins))
+    real_open = builtins.open
+
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if not check_path_allowed(str(file), allowed_directories):
+            raise PermissionError(f"Access to path '{file}' is not allowed")
+        return real_open(file, mode, *args, **kwargs)
+
+    safe_builtins["open"] = guarded_open
+
+    for name in ("eval", "exec", "compile", "input", "breakpoint"):
+        safe_builtins.pop(name, None)
+
+    return safe_builtins
 
 
-def check_path_allowed(path: str, allowed_directories: Iterable[str]) -> bool:
+def apply_memory_limit(max_memory_mb: int) -> None:
+    """Cap this process's total address space by lowering the SOFT
+    RLIMIT_AS only -- the hard limit is left untouched (usually
+    RLIM_INFINITY), specifically so a later `reset_memory_limit()` call can
+    raise the soft limit back up. Call this around the one thing that
+    actually needs capping (the worker's `exec(code, namespace)` call, see
+    sandbox/executor.py) -- never in the parent/agent process, and never
+    left on permanently in the worker (see reset_memory_limit below for why).
+
+    KNOWN LIMITATION: RLIMIT_AS is enforced reliably by the Linux kernel,
+    but is loosely enforced by the macOS (Darwin/XNU) kernel -- on Mac this
+    is a best-effort cap, not a guarantee. What still holds on Mac even if
+    this doesn't fire: since the sandboxed code now runs in its own worker
+    process (sandbox/executor.py), if the OS ends up OOM-killing that
+    process anyway, only the worker dies -- the agent loop and the rest of
+    the program keep running, and the crash is reported back as an
+    observation instead of taking the whole run down.
     """
-    TODO(学生实现): 判断 path 是否落在 allowed_directories 中的某一个目录内。
-    注意处理 ../ 这种路径穿越攻击 —— 用 os.path.realpath() 规范化之后再比较。
+    if max_memory_mb <= 0:
+        return  # 0 or negative means "no limit" -- don't call setrlimit(0)
+    limit_bytes = max_memory_mb * 1024 * 1024
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        new_soft = limit_bytes if hard == resource.RLIM_INFINITY else min(limit_bytes, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (new_soft, hard))
+    except (ValueError, OSError):
+        # Some platforms/containers refuse to lower RLIMIT_AS at all.
+        # Don't crash the worker over it -- the process-level isolation
+        # (killable/OOM-killable independently of the parent) still holds.
+        pass
+
+
+def reset_memory_limit() -> None:
+    """Undo apply_memory_limit(): raise the soft RLIMIT_AS back up to the
+    (untouched) hard limit -- usually RLIM_INFINITY, i.e. no cap.
+
+    Why this exists: a tight memory cap (e.g. 128MB in tests) is barely
+    enough headroom for the user's own code, let alone the worker's OWN
+    bookkeeping between calls -- notably, `multiprocessing.Queue.put()`
+    lazily starts a background feeder thread on its first use, which needs
+    to mmap a new thread stack. On a real Linux kernel (which -- unlike
+    macOS -- actually enforces RLIMIT_AS) a fresh, fully-loaded, forked
+    CPython process can already be sitting close to a tight cap, and that
+    mmap fails with "RuntimeError: can't start new thread" -- not because
+    anything is actually leaking or wrong, just because the cap meant for
+    the sandboxed code was still in effect for the worker's own plumbing.
+    Calling this right after exec() finishes, before touching the result
+    queue, keeps the cap scoped to exactly the code it's meant to constrain.
     """
-    raise NotImplementedError
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+    except (ValueError, OSError):
+        pass
