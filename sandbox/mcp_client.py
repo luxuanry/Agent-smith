@@ -15,12 +15,26 @@ read_file(...), it needs a normal blocking function call that returns a
 value, not something it has to `await`.
 
 To bridge this, we start a background thread that runs its own asyncio
-event loop for the lifetime of the connection. Every time a sandbox
-function needs to actually talk to the MCP server, it schedules that async
-call onto the background loop and *blocks* until the result comes back
-(via asyncio.run_coroutine_threadsafe(...).result()). From the sandbox's
-point of view, this looks and behaves like an ordinary synchronous function
-call — the async machinery is fully hidden behind it.
+event loop for the lifetime of the connection. Sandbox functions schedule
+async calls onto that loop and *block* until the result comes back, so from
+the sandbox's point of view it's an ordinary synchronous function call.
+
+Why the session lives inside ONE persistent task
+--------------------------------------------------
+anyio (which the MCP SDK is built on) requires that a cancel scope — which
+is what `async with stdio_client(...)` / `async with ClientSession(...)`
+open under the hood — be entered AND exited from the *same* asyncio Task.
+
+`asyncio.run_coroutine_threadsafe(coro, loop)` wraps each call in a brand
+new Task. If we open the connection in one such call and close it in
+another, the open and close happen in two different Tasks, and anyio raises
+"Attempted to exit cancel scope in a different task than it was entered
+in". So instead of opening/closing across separate scheduled calls, the
+entire session lifetime (open -> wait -> close) runs inside a single
+long-lived coroutine/Task (`_session_lifecycle`). Individual tool calls are
+separate, self-contained tasks that only *use* the already-open session —
+they never touch the enter/exit of its cancel scope, so they're safe to
+run as their own short-lived tasks.
 """
 from __future__ import annotations
 
@@ -38,26 +52,9 @@ class MCPClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._session: Optional[ClientSession] = None
-        self._session_cm = None  # async context manager for ClientSession
-        self._stdio_cm = None  # async context manager for stdio_client
-
-    # ------------------------------------------------------------------
-    # Background event loop plumbing
-    # ------------------------------------------------------------------
-    def _start_background_loop(self) -> None:
-        self._loop = asyncio.new_event_loop()
-
-        def run_loop():
-            asyncio.set_event_loop(self._loop)
-            self._loop.run_forever()
-
-        self._thread = threading.Thread(target=run_loop, daemon=True)
-        self._thread.start()
-
-    def _run_coro(self, coro):
-        """Schedule `coro` on the background loop and block until it's done."""
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result()
+        self._stop_event: Optional[asyncio.Event] = None
+        self._ready = threading.Event()  # signalled once the session is initialized (or failed)
+        self._connect_error: Optional[BaseException] = None
 
     # ------------------------------------------------------------------
     # Connecting
@@ -67,19 +64,41 @@ class MCPClient:
 
         `command` example: "python mcp_tools_mbpp.py"
         """
-        self._start_background_loop()
-
         parts = command.split()
         server_params = StdioServerParameters(command=parts[0], args=parts[1:])
 
-        async def _connect():
-            self._stdio_cm = stdio_client(server_params)
-            read, write = await self._stdio_cm.__aenter__()
-            self._session_cm = ClientSession(read, write)
-            self._session = await self._session_cm.__aenter__()
-            await self._session.initialize()
+        def run_loop():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_until_complete(self._session_lifecycle(server_params))
 
-        self._run_coro(_connect())
+        self._thread = threading.Thread(target=run_loop, daemon=True)
+        self._thread.start()
+
+        # Block the calling (sync) thread until the background task has
+        # either finished initializing the session, or failed to.
+        self._ready.wait()
+        if self._connect_error is not None:
+            raise self._connect_error
+
+    async def _session_lifecycle(self, server_params: StdioServerParameters) -> None:
+        """Owns the ENTIRE lifetime of the connection: open, stay open
+        while tool calls happen elsewhere, then close — all within this
+        one task, which is what anyio's cancel-scope rule requires.
+        """
+        self._stop_event = asyncio.Event()
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    self._session = session
+                    self._ready.set()  # connect_stdio() can now return
+                    await self._stop_event.wait()  # keep the session open until close() is called
+        except BaseException as e:
+            self._connect_error = e
+            self._ready.set()
+        finally:
+            self._session = None
 
     def connect_http(self, url: str) -> None:
         """TODO: implement when an HTTP-based MCP server is needed
@@ -90,6 +109,15 @@ class MCPClient:
     # ------------------------------------------------------------------
     # Discovering and wrapping tools
     # ------------------------------------------------------------------
+    def _run_coro(self, coro):
+        """Schedule `coro` as its own short-lived task on the background
+        loop and block until it's done. Safe to call for anything that
+        only USES the already-open session (list_tools, call_tool) —
+        never for opening/closing the session itself.
+        """
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
     def discover_tools(self) -> Dict[str, object]:
         async def _list():
             result = await self._session.list_tools()
@@ -105,9 +133,8 @@ class MCPClient:
 
         NOTE: wrapped functions only accept KEYWORD arguments (e.g.
         read_file(filepath="a.py", start_line=1, end_line=10)), never
-        positional ones. This keeps the wrapper simple and unambiguous —
-        the system prompt should tell the LLM to always call tools with
-        keyword arguments.
+        positional ones. The system prompt should tell the LLM to always
+        call tools with keyword arguments.
         """
         return {name: self._make_wrapper(name) for name in self.tools}
 
@@ -128,18 +155,13 @@ class MCPClient:
     # Cleanup
     # ------------------------------------------------------------------
     def close(self) -> None:
-        """Shut down the MCP session, the subprocess, and the background
-        thread. Call this once you're done with the client (e.g. in a
-        try/finally around agent.run(...)) so the process doesn't hang.
+        """Signal `_session_lifecycle` to exit its `async with` blocks
+        (closing the session and the subprocess from within the same task
+        that opened them), then stop the background loop and thread.
         """
-        if not self._loop:
+        if not self._loop or not self._stop_event:
             return
 
-        async def _close():
-            if self._session_cm:
-                await self._session_cm.__aexit__(None, None, None)
-            if self._stdio_cm:
-                await self._stdio_cm.__aexit__(None, None, None)
-
-        self._run_coro(_close())
-        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._loop.call_soon_threadsafe(self._stop_event.set)
+        if self._thread:
+            self._thread.join(timeout=10)

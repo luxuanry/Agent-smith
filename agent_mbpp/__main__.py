@@ -2,18 +2,19 @@
 MBPP Agent CLI (Section V.3 point 1).
 
 Usage:
-    uv run python -m agent_mbpp --task-file ../cache/mbpp_task.json \\
-        --output ../cache/mbpp_solution.json \\
+    uv run python -m agent_mbpp --task-file ../cache/mbpp_task.json \
+        --output ../cache/mbpp_solution.json \
         --model-name "model/name" --provider-url "https://provider.api/v1"
 
-STAGE 0 (current): no MCP server — the sandbox only has final_answer(),
-and the tests are given to the LLM in the task text.
-  TODO(stage 1): connect mcp_tools_mbpp.py, generate the sandbox manual, enforce limits.
+STAGE 1 (current): connects to mcp_tools_mbpp.py over stdio, discovers its
+  tools (run_tests), generates the sandbox manual from them, and enforces
+  the hard limits (iterations/tokens/timeout).
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -22,8 +23,10 @@ from common.env import load_env_file
 from common.llm_provider import LLMProvider
 from common.models import MBPPTaskInput, SandboxConfig, SolutionOutput
 from sandbox.executor import Sandbox
+from sandbox.manual import generate_sandbox_manual
+from sandbox.mcp_client import MCPClient
 
-# Hard limits — Section VI.1.1 (only MAX_ITERATIONS is enforced in stage 0)
+# Hard limits — Section VI.1.1
 MAX_ITERATIONS = 10
 MAX_INPUT_TOKENS = 6_000
 MAX_OUTPUT_TOKENS = 1_500
@@ -56,15 +59,30 @@ def main(argv=None) -> None:
     load_env_file(".env")
     start = time.perf_counter()
     task_id = "unknown"
+    mcp_client = MCPClient()
 
     try:
         with open(args.task_file, encoding="utf-8") as f:
             task = MBPPTaskInput(**json.load(f))
         task_id = str(task.task_id)
 
+        # run_tests() (inside mcp_tools_mbpp.py) needs to know which task is
+        # currently being solved, so it can load the real test_list instead
+        # of trusting whatever the LLM claims.
+        os.environ["MBPP_TASK_FILE"] = args.task_file
+
+        # Connect to the MBPP MCP server and discover what tools it exposes.
+        mcp_client.connect_stdio("python mcp_tools_mbpp.py")
+        mcp_client.discover_tools()
+        wrapped_tools = mcp_client.wrap_as_python_functions()
+
+        # Turn the discovered tool schemas into readable text so the system
+        # prompt actually tells the LLM these tools exist and how to call them.
+        sandbox_manual = generate_sandbox_manual(mcp_client.tools)
+
         provider = LLMProvider(args.model_name, args.provider_url, args.api_key_env)
-        sandbox = Sandbox(config=SandboxConfig())
-        system_prompt = build_system_prompt(sandbox_manual="", benchmark="mbpp")
+        sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools)
+        system_prompt = build_system_prompt(sandbox_manual=sandbox_manual, benchmark="mbpp")
 
         agent = AgentLoop(
             llm_provider=provider,
@@ -90,9 +108,20 @@ def main(argv=None) -> None:
             error=f"{type(e).__name__}: {e}",
         )
 
+    # Write the result BEFORE attempting any cleanup, so a cleanup failure
+    # (e.g. shutting down the MCP subprocess) can never cause us to lose a
+    # task result we already have.
     with open(args.output, "w", encoding="utf-8") as f:
         f.write(result.model_dump_json(indent=2))
     print(f"success={result.success} iterations={result.iterations} error={result.error}")
+
+    try:
+        # Shuts down the MCP session, the mcp_tools_mbpp.py subprocess, and
+        # the background event-loop thread — without this the process can
+        # hang instead of exiting cleanly.
+        mcp_client.close()
+    except Exception as e:
+        print(f"[warning] MCP client cleanup failed: {type(e).__name__}: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

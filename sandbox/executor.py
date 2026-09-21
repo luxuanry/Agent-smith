@@ -25,6 +25,7 @@ import traceback
 from typing import Any, Callable, Dict, Optional
 
 from common.models import SandboxConfig
+from sandbox.security import ImportGuard, build_restricted_builtins
 
 
 class Sandbox:
@@ -34,6 +35,7 @@ class Sandbox:
         self.final_answer_value: Optional[str] = None
         self.final_answer_called: bool = False
         self.namespace: Dict[str, Any] = {}
+        self._import_guard = ImportGuard(config.authorized_imports)
         self._setup_namespace()
 
     def _final_answer(self, answer: str) -> None:

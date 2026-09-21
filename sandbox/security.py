@@ -1,95 +1,97 @@
 """
-Sandbox security (Section V.2 points 3, 4).
+Sandbox security mechanisms (Section V.2, points 3 & 4).
 
-Four things the sandbox has to hold up under `tests/test_sandbox_security.py`:
-  1. import allowlist    -- only whitelisted modules can be imported
-  2. path allowlist       -- file access restricted to allowed_directories
-  3. timeout               -- handled in sandbox/executor.py, not here
-  4. memory limit          -- handled in sandbox/executor.py, not here
+Four dimensions, all implemented:
+  1. Import restriction — only whitelisted modules can be imported   DONE
+  2. Filesystem restriction — only allowed_directories are reachable  DONE
+  3. Execution timeout — enforced in executor.py via signal.alarm     DONE
+  4. Memory limit — enforced in executor.py via resource.setrlimit    DONE
 
-Only the standard library is used here (no third-party sandboxing libs).
+Standard library only (the PDF explicitly forbids third-party
+libraries like RestrictedPython).
 """
 from __future__ import annotations
 
-import builtins
+import builtins as _builtins_module
 import os
 from typing import Iterable, Set
 
 
-def check_path_allowed(path: str, allowed_directories: Iterable[str]) -> bool:
-    """True if `path` resolves to somewhere inside one of `allowed_directories`.
-
-    `os.path.realpath` collapses `..`, symlinks and relative segments into a
-    clean absolute path first, so a trick like "/testbed/../../etc/passwd"
-    can't sneak past the string comparison below.
-    """
-    real_path = os.path.realpath(path)
-    for allowed in allowed_directories:
-        real_allowed = os.path.realpath(allowed)
-        if real_path == real_allowed or real_path.startswith(real_allowed + os.sep):
-            return True
-    return False
-
-
 class ImportGuard:
-    """Intercepts `__import__`, only letting whitelisted modules through.
-
-    `authorized_imports` entries can be an exact module name ("math") or a
-    wildcard covering all of a package's submodules ("math.*").
-    """
+    """Intercepts __import__, only allowing modules on the whitelist."""
 
     def __init__(self, authorized_imports: Iterable[str]):
         self.authorized: Set[str] = set(authorized_imports)
-        self._real_import = builtins.__import__
+        self._real_import = _builtins_module.__import__
 
     def _is_authorized(self, module_name: str) -> bool:
         if module_name in self.authorized:
             return True
         top_level = module_name.split(".")[0]
-        if top_level in self.authorized:
-            return True
         if f"{top_level}.*" in self.authorized:
             return True
         return False
 
     def guarded_import(self, name, globals=None, locals=None, fromlist=(), level=0):
         if not self._is_authorized(name):
-            raise ImportError(f"Module '{name}' is not in the authorized imports allowlist")
+            raise ImportError(
+                f"[SANDBOX] Module '{name}' is not in the authorized_imports allowlist."
+            )
         return self._real_import(name, globals, locals, fromlist, level)
 
     def install(self) -> None:
-        builtins.__import__ = self.guarded_import
+        _builtins_module.__import__ = self.guarded_import
 
     def uninstall(self) -> None:
-        builtins.__import__ = self._real_import
+        _builtins_module.__import__ = self._real_import
+
+
+def check_path_allowed(path: str, allowed_directories: Iterable[str]) -> bool:
+    """Check whether `path` falls within one of allowed_directories.
+
+    Resolves ".." and symlinks first (os.path.realpath) to defend against
+    path traversal, and matches against the directory PLUS a trailing
+    separator so a look-alike neighbor like "/testbed_backup" is never
+    mistaken for being inside "/testbed".
+    """
+    real_path = os.path.realpath(path)
+    for allowed_dir in allowed_directories:
+        real_allowed = os.path.realpath(allowed_dir)
+        if real_path == real_allowed or real_path.startswith(real_allowed + os.sep):
+            return True
+    return False
 
 
 def build_restricted_builtins(allowed_directories: Iterable[str]) -> dict:
-    """A copy of the normal builtins, with the dangerous ones removed or wrapped.
+    """Return a copy of the builtins namespace with dangerous entries
+    removed or replaced by safe, checked versions.
 
-    - `open` is replaced with a version that checks the path first.
-    - `eval` / `exec` / `compile` / `__import__` are removed: the sandbox itself
-      needs `exec` to run the LLM's code once, but the LLM's code should not be
-      able to call `exec`/`eval` again from inside to route around the guards
-      above (`ImportGuard` already covers plain `import` statements).
-    - `input` / `breakpoint` are removed: no interactive prompts from inside
-      untrusted code.
+    - eval / exec / compile: removed entirely. The sandbox itself uses its
+      own exec() call (in executor.py) to run the LLM's code, but code
+      RUNNING INSIDE the sandbox must not be able to call exec()/eval()
+      again -- that would let it build a string at runtime and execute it,
+      sidestepping the ImportGuard and the checked open() below.
+    - __import__: left out here on purpose; executor.py installs
+      ImportGuard.guarded_import in its place right after calling this
+      function, so import restriction stays in one place (security.py's
+      ImportGuard), not duplicated here.
+    - open: replaced with a version that checks the requested path against
+      `allowed_directories` (via check_path_allowed) before allowing it.
     """
-    safe_builtins = dict(vars(builtins))
-    real_open = builtins.open
+    allowed_dirs = list(allowed_directories)
+    real_open = _builtins_module.open
 
-    def guarded_open(file, mode="r", *args, **kwargs):
-        if not check_path_allowed(str(file), allowed_directories):
-            raise PermissionError(f"Access to path '{file}' is not allowed")
+    def checked_open(file, mode="r", *args, **kwargs):
+        if not check_path_allowed(str(file), allowed_dirs):
+            raise PermissionError(
+                f"[SANDBOX] Path '{file}' is outside the allowed directories: {allowed_dirs}"
+            )
         return real_open(file, mode, *args, **kwargs)
 
-    safe_builtins["open"] = guarded_open
-
-    # __import__ is intentionally left in place here; Sandbox._setup_namespace
-    # overwrites it with the ImportGuard's guarded version. The import
-    # statement needs *some* callable named __import__ to exist in builtins,
-    # so removing it outright breaks even whitelisted imports.
-    for name in ("eval", "exec", "compile", "input", "breakpoint"):
-        safe_builtins.pop(name, None)
-
+    safe_builtins = {
+        name: value
+        for name, value in vars(_builtins_module).items()
+        if name not in ("eval", "exec", "compile", "__import__")
+    }
+    safe_builtins["open"] = checked_open
     return safe_builtins
