@@ -84,6 +84,7 @@ import multiprocessing as mp
 import queue as queue_module
 import time
 import traceback
+import codeop
 from typing import Any, Callable, Dict, Optional
 
 from common.models import SandboxConfig
@@ -137,6 +138,9 @@ def _worker_main(
     """
     import contextlib
     import io
+    import signal
+
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
 
     # NOTE: the memory cap is intentionally NOT applied here. It's scoped
     # to just the exec() call below instead -- see the module docstring's
@@ -171,8 +175,15 @@ def _worker_main(
         import_guard.install()
         apply_memory_limit(config.max_memory_mb)
         try:
+            try:
+                compiled = compile(code, "<sandbox>", "single")
+            except SyntaxError:
+                try:
+                    compiled = compile(code, "<sandbox>", "exec")
+                except SyntaxError as e:
+                    raise e from None
             with contextlib.redirect_stdout(stdout_buffer):
-                exec(code, namespace)
+                exec(compiled, namespace)
         except (KeyboardInterrupt, SystemExit):
             raise
         except MemoryError:
@@ -282,19 +293,38 @@ class Sandbox:
     def run_repl(self) -> None:
         """Read code, execute it, print result. `exit` or EOF quits."""
         print("Agent Smith sandbox. Type 'exit' to quit.")
+        buffer : List[str] = []
         while True:
             try:
-                line = input(">>> ")
+                line = input("... " if buffer else ">>> ")
             except EOFError:
                 print()
                 break
-            if line.strip() == "exit":
-                break
-            if not line.strip():
+            except KeyboardInterrupt:
+                print("\nKeyboardInterrupt")
+                buffer.clear()
                 continue
-            output = self.execute(line)
+            if not buffer:
+                if line.strip() == "exit":
+                    break
+                if not line.strip():
+                    continue
+            buffer.append(line)
+            source = "\n".join(buffer)
+            try:
+                if codeop.compile_command(source, "<sandbox>","single") is None:
+                    continue
+            except SyntaxError:
+                pass
+            buffer.clear()
+
+            try:
+                output = self.execute(source)
+            except KeyboardInterrupt:
+                print("\nKeyboardInterrupt")
+                continue
             if output:
-                print(output, end="" if output.endswith("\n") else "\n")
+                print(output, end = "" if output.endswith("\n") else "\n")
             if self.final_answer_called:
                 print(f"[final_answer] {self.final_answer_value!r}")
                 self.final_answer_called = False
