@@ -1,55 +1,173 @@
 """
-MCP Client（Section III.1 图示 + Section V.2 第5点）。
+MCP Client (Section III.1 diagram + Section V.2 point 5).
 
-沙盒本身要作为一个 MCP client，去连接一个 MCP server
-（可能是你们自己的 mcp_tools_mbpp.py / mcp_tools_swebench.py，
-也可能是评审时连的"未知 MCP server"——所以这里的逻辑必须是通用的，
-不能写死"我知道有哪几个工具"）。
+The sandbox itself acts as an MCP client, connecting to an MCP server
+(could be our own mcp_tools_mbpp.py / mcp_tools_swebench.py, or, during
+evaluation, an unknown MCP server — so this logic must stay generic and
+never hardcode "I know there are exactly these tools").
 
-两种连接方式都要支持：
-  - stdio: 用子进程启动 `python mcp_tools_mbpp.py`，通过标准输入输出通信
-  - HTTP (streamable): 连接一个 URL
+Sync vs async — why the background thread exists
+--------------------------------------------------
+The official MCP Python SDK is async (built on asyncio): every call to the
+server (listing tools, calling a tool) is an `await`-able coroutine. But the
+sandbox's exec(code) runs plain synchronous code — when the LLM's code calls
+read_file(...), it needs a normal blocking function call that returns a
+value, not something it has to `await`.
 
-=== 你们需要实现的部分（TODO） ===
-1. `connect_stdio(command: str)`：启动子进程并建立 MCP session
-2. `connect_http(url: str)`：连接远程 HTTP MCP server
-3. `discover_tools()`：调用 MCP 协议里的 list_tools，拿到每个工具的
-   name / description / 参数 schema
-4. `wrap_as_python_functions()`：把每个 MCP 工具包装成一个普通的
-   Python 函数，函数内部实际上是通过 MCP 协议调用远程工具、
-   再把结果转成字符串返回——这样 sandbox/executor.py 才能直接把它们
-   塞进 exec() 的命名空间里给 LLM 调用
+To bridge this, we start a background thread that runs its own asyncio
+event loop for the lifetime of the connection. Sandbox functions schedule
+async calls onto that loop and *block* until the result comes back, so from
+the sandbox's point of view it's an ordinary synchronous function call.
 
-推荐用官方 `mcp` Python SDK（pip install mcp），
-文档：https://modelcontextprotocol.io/
+Why the session lives inside ONE persistent task
+--------------------------------------------------
+anyio (which the MCP SDK is built on) requires that a cancel scope — which
+is what `async with stdio_client(...)` / `async with ClientSession(...)`
+open under the hood — be entered AND exited from the *same* asyncio Task.
+
+`asyncio.run_coroutine_threadsafe(coro, loop)` wraps each call in a brand
+new Task. If we open the connection in one such call and close it in
+another, the open and close happen in two different Tasks, and anyio raises
+"Attempted to exit cancel scope in a different task than it was entered
+in". So instead of opening/closing across separate scheduled calls, the
+entire session lifetime (open -> wait -> close) runs inside a single
+long-lived coroutine/Task (`_session_lifecycle`). Individual tool calls are
+separate, self-contained tasks that only *use* the already-open session —
+they never touch the enter/exit of its cancel scope, so they're safe to
+run as their own short-lived tasks.
 """
 from __future__ import annotations
 
-from typing import Callable, Dict
+import asyncio
+import os
+import threading
+from typing import Callable, Dict, Optional
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
 
 class MCPClient:
     def __init__(self):
-        self.tools: Dict[str, dict] = {}   # tool_name -> schema (从 server 发现)
+        self.tools: Dict[str, object] = {}  # tool_name -> Tool schema object (from the server)
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._session: Optional[ClientSession] = None
+        self._stop_event: Optional[asyncio.Event] = None
+        self._ready = threading.Event()  # signalled once the session is initialized (or failed)
+        self._connect_error: Optional[BaseException] = None
 
+    # ------------------------------------------------------------------
+    # Connecting
+    # ------------------------------------------------------------------
     def connect_stdio(self, command: str) -> None:
-        """TODO(学生实现): 用 mcp SDK 的 stdio_client 启动子进程并连接。"""
-        raise NotImplementedError
+        """Launch the MCP server as a subprocess and connect over stdin/stdout.
+
+        `command` example: "python mcp_tools_mbpp.py"
+        """
+        parts = command.split()
+        # Pass the full environment explicitly: without `env`, the MCP SDK
+        # only forwards a small whitelist (PATH, HOME, ...) to the server
+        # subprocess, so variables like MBPP_TASK_FILE would be dropped.
+        server_params = StdioServerParameters(
+            command=parts[0], args=parts[1:], env=dict(os.environ)
+        )
+
+        def run_loop():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._loop.run_until_complete(self._session_lifecycle(server_params))
+
+        self._thread = threading.Thread(target=run_loop, daemon=True)
+        self._thread.start()
+
+        # Block the calling (sync) thread until the background task has
+        # either finished initializing the session, or failed to.
+        self._ready.wait()
+        if self._connect_error is not None:
+            raise self._connect_error
+
+    async def _session_lifecycle(self, server_params: StdioServerParameters) -> None:
+        """Owns the ENTIRE lifetime of the connection: open, stay open
+        while tool calls happen elsewhere, then close — all within this
+        one task, which is what anyio's cancel-scope rule requires.
+        """
+        self._stop_event = asyncio.Event()
+        try:
+            async with stdio_client(server_params) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    self._session = session
+                    self._ready.set()  # connect_stdio() can now return
+                    await self._stop_event.wait()  # keep the session open until close() is called
+        except BaseException as e:
+            self._connect_error = e
+            self._ready.set()
+        finally:
+            self._session = None
 
     def connect_http(self, url: str) -> None:
-        """TODO(学生实现): 用 mcp SDK 的 streamable HTTP client 连接。"""
-        raise NotImplementedError
+        """TODO: implement when an HTTP-based MCP server is needed
+        (Section V.2 requires supporting both stdio and HTTP transports).
+        """
+        raise NotImplementedError("TODO: HTTP transport")
 
-    def discover_tools(self) -> Dict[str, dict]:
-        """TODO(学生实现): 调用 MCP list_tools，缓存到 self.tools 并返回。"""
-        raise NotImplementedError
+    # ------------------------------------------------------------------
+    # Discovering and wrapping tools
+    # ------------------------------------------------------------------
+    def _run_coro(self, coro):
+        """Schedule `coro` as its own short-lived task on the background
+        loop and block until it's done. Safe to call for anything that
+        only USES the already-open session (list_tools, call_tool) —
+        never for opening/closing the session itself.
+        """
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result()
+
+    def discover_tools(self) -> Dict[str, object]:
+        async def _list():
+            result = await self._session.list_tools()
+            return result.tools
+
+        tools = self._run_coro(_list())
+        self.tools = {t.name: t for t in tools}
+        return self.tools
 
     def wrap_as_python_functions(self) -> Dict[str, Callable]:
-        """
-        TODO(学生实现): 为 self.tools 里的每一个工具生成一个 Python 包装函数。
+        """Turn every discovered MCP tool into a plain Python function that
+        can be dropped straight into the sandbox's exec() namespace.
 
-        例如工具 "read_file" 应该变成一个可以这样调用的函数：
-            read_file(filepath="/testbed/src/mail.py", start_line=1, end_line=50)
-        函数内部通过 MCP 协议真正调用远程工具，并把结果（通常是字符串）返回。
+        NOTE: wrapped functions only accept KEYWORD arguments (e.g.
+        read_file(filepath="a.py", start_line=1, end_line=10)), never
+        positional ones. The system prompt should tell the LLM to always
+        call tools with keyword arguments.
         """
-        raise NotImplementedError
+        return {name: self._make_wrapper(name) for name in self.tools}
+
+    def _make_wrapper(self, tool_name: str) -> Callable:
+        def wrapper(**kwargs):
+            async def _call():
+                return await self._session.call_tool(tool_name, arguments=kwargs)
+
+            result = self._run_coro(_call())
+            # MCP tool results are a list of content blocks; join the text ones.
+            texts = [block.text for block in result.content if hasattr(block, "text")]
+            return "\n".join(texts)
+
+        wrapper.__name__ = tool_name
+        return wrapper
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+    def close(self) -> None:
+        """Signal `_session_lifecycle` to exit its `async with` blocks
+        (closing the session and the subprocess from within the same task
+        that opened them), then stop the background loop and thread.
+        """
+        if not self._loop or not self._stop_event:
+            return
+
+        self._loop.call_soon_threadsafe(self._stop_event.set)
+        if self._thread:
+            self._thread.join(timeout=10)

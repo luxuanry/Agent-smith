@@ -1,34 +1,58 @@
 """
-沙盒手册（Sandbox Manual）—— Section V.2 第6点。
+Sandbox manual (Section V.2 point 6).
 
-这份"手册"就是塞进 system prompt 里、让 LLM 知道"有哪些工具可以用、
-怎么用"的那部分文字。要求是**动态生成**：连不同的 MCP server，
-手册内容要自动变化，不能写死。
+This turns the tool schemas discovered from an MCP server into a
+human-readable block of text that gets embedded in the system prompt, so
+the LLM actually knows which tools exist and how to call them. It must be
+generated DYNAMICALLY from whatever MCP server we're connected to — if we
+swap in a different server, this text should automatically reflect the new
+set of tools, never be hardcoded.
 
-=== 你们需要实现的部分（TODO） ===
+Input: the `tools` dict returned by MCPClient.discover_tools(), i.e.
+{tool_name: Tool} where Tool is the MCP SDK's Tool object with
+.name, .description and .inputSchema (a JSON Schema dict).
 """
 from __future__ import annotations
 
 from typing import Dict
 
+_JSON_TYPE_TO_PY = {
+    "string": "str",
+    "integer": "int",
+    "number": "float",
+    "boolean": "bool",
+    "array": "list",
+    "object": "dict",
+}
 
-def generate_sandbox_manual(tool_schemas: Dict[str, dict]) -> str:
-    """
-    TODO(学生实现):
-    输入: MCP server discover_tools() 返回的 {tool_name: schema} 字典
-    输出: 一段人类/LLM可读的文档字符串，例如：
 
-        Available tools:
+def generate_sandbox_manual(tools: Dict[str, object]) -> str:
+    if not tools:
+        return "(no extra tools connected)"
 
-        - read_file(filepath: str, start_line: int, end_line: int) -> str
-          Read the content of a file with line numbers.
+    lines = ["Available tools:", ""]
 
-        - search_code(pattern: str, file_pattern: str) -> str
-          Perform a grep-like search in the codebase.
+    for name, tool in tools.items():
+        schema = getattr(tool, "inputSchema", None) or {}
+        properties = schema.get("properties", {})
+        required = set(schema.get("required", []))
 
-        ...
+        params = []
+        for prop_name, prop_schema in properties.items():
+            py_type = _JSON_TYPE_TO_PY.get(prop_schema.get("type"), "Any")
+            if prop_name in required:
+                params.append(f"{prop_name}: {py_type}")
+            else:
+                params.append(f"{prop_name}: {py_type} = None")
 
-    提示：MCP 的 tool schema 通常是 JSON Schema 格式，
-    里面有 name / description / inputSchema（参数名+类型）。
-    """
-    raise NotImplementedError("TODO: 从 tool_schemas 生成人类可读的手册文本")
+        signature = f"{name}({', '.join(params)})"
+        description = (getattr(tool, "description", "") or "").strip()
+
+        lines.append(f"- {signature}")
+        for desc_line in description.splitlines():
+            desc_line = desc_line.strip()
+            if desc_line:
+                lines.append(f"  {desc_line}")
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"

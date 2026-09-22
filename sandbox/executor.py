@@ -63,20 +63,29 @@ Design:
     this is no different from any other failed step: it sees an error
     observation and tries again.
 
-KNOWN CAVEAT -- mcp_tools and fork:
-  `mcp_tools` (built in mcp_client.py) gets forked into the worker along
-  with everything else already in the parent's memory at that point.
-  That's fine as long as each tool call is a fresh, self-contained round
-  trip. It is NOT safe if a tool closes over a live async connection or a
-  background thread that was already running at fork time -- forking
-  after a thread has started, or forking a running asyncio event loop, can
-  deadlock or corrupt state in the child (this is a well-known Python/OS
-  gotcha, not specific to this project). mcp_client.py is still a stub
-  today (raises NotImplementedError), so this doesn't bite yet -- but when
-  it's implemented, prefer having the WORKER open its own MCP connection
-  itself (pass a zero-arg "connect and build tools" factory into
-  `_worker_main` instead of already-connected tool objects), so the
-  connection is only ever touched by the process that owns it.
+MCP tools and the worker process:
+  MCP tools must NOT be called directly inside the worker. The MCP
+  connection lives in a background thread of the PARENT process, and fork
+  only copies the calling thread -- so in the child, a tool call would wait
+  forever for a thread that doesn't exist (the call hangs until timeout).
+
+  Instead, the worker gets small proxy functions with the same names. A
+  proxy sends (tool_name, kwargs) to the parent over a Pipe and waits for
+  the reply; the parent, while polling for the result in execute(), runs
+  the real MCP call and sends the result back. So the connection is only
+  ever used by the process that owns it, and MCP tools run outside the
+  sandbox, as Section V.2 describes.
+
+  A Pipe (not a Queue) is used on purpose: Connection.send() writes
+  synchronously and never starts a background feeder thread, so a tool
+  call made while the memory cap is active can't fail with
+  "can't start new thread" (the Queue problem described above).
+
+Import restriction:
+  The ImportGuard is installed only in the sandbox namespace's own
+  __builtins__ (see _worker_main), NOT globally with install(). A global
+  install would also apply to trusted code running in the worker, such as
+  the tool proxies.
 """
 from __future__ import annotations
 
@@ -84,7 +93,8 @@ import multiprocessing as mp
 import queue as queue_module
 import time
 import traceback
-from typing import Any, Callable, Dict, Optional
+from multiprocessing.connection import Connection
+from typing import Any, Callable, Dict, List, Optional
 
 from common.models import SandboxConfig
 from sandbox.security import ImportGuard, apply_memory_limit, build_restricted_builtins, reset_memory_limit
@@ -129,7 +139,8 @@ def _worker_main(
     code_queue: "mp.Queue",
     result_queue: "mp.Queue",
     config: SandboxConfig,
-    mcp_tools: Dict[str, Callable],
+    tool_names: List[str],
+    tool_conn: "Connection",
 ) -> None:
     """Entry point of the child process. Runs until it receives `None`
     (shutdown sentinel) or is killed by the parent. Everything in here
@@ -150,8 +161,23 @@ def _worker_main(
         final_answer_state["value"] = str(answer)
         final_answer_state["called"] = True
 
+    def _make_tool_proxy(tool_name: str) -> Callable:
+        """A stand-in for an MCP tool: forwards the call to the parent
+        process (which owns the MCP connection) and returns its reply."""
+
+        def proxy(**kwargs):
+            tool_conn.send((tool_name, kwargs))
+            status, value = tool_conn.recv()
+            if status == "error":
+                raise RuntimeError(value)
+            return value
+
+        proxy.__name__ = tool_name
+        return proxy
+
     namespace["final_answer"] = _final_answer
-    namespace.update(mcp_tools)
+    for tool_name in tool_names:
+        namespace[tool_name] = _make_tool_proxy(tool_name)
 
     import_guard = ImportGuard(config.authorized_imports)
     restricted_builtins = build_restricted_builtins(config.allowed_directories)
@@ -168,7 +194,6 @@ def _worker_main(
 
         stdout_buffer = io.StringIO()
         error: Optional[str] = None
-        import_guard.install()
         apply_memory_limit(config.max_memory_mb)
         try:
             with contextlib.redirect_stdout(stdout_buffer):
@@ -181,7 +206,6 @@ def _worker_main(
             # Keep the partial output, then show the error so the LLM can fix its code.
             error = traceback.format_exc(limit=-1)
         finally:
-            import_guard.uninstall()
             # Lift the memory cap before touching result_queue.put() below,
             # which may need to start its own background thread the first
             # time it's called -- that shouldn't be squeezed by a limit
@@ -212,12 +236,20 @@ class Sandbox:
         self._ctx = mp.get_context("fork")
         self._code_queue: "mp.Queue" = self._ctx.Queue()
         self._result_queue: "mp.Queue" = self._ctx.Queue()
+        # Pipe for MCP tool calls: the worker sends requests, we answer them.
+        self._tool_conn, self._worker_tool_conn = self._ctx.Pipe()
         self._worker: mp.process.BaseProcess = self._spawn_worker()
 
     def _spawn_worker(self) -> mp.process.BaseProcess:
         worker = self._ctx.Process(
             target=_worker_main,
-            args=(self._code_queue, self._result_queue, self.config, self.mcp_tools),
+            args=(
+                self._code_queue,
+                self._result_queue,
+                self.config,
+                list(self.mcp_tools),
+                self._worker_tool_conn,
+            ),
             daemon=True,
         )
         worker.start()
@@ -231,7 +263,25 @@ class Sandbox:
         # worker; start clean so the next call can't accidentally read it.
         self._code_queue = self._ctx.Queue()
         self._result_queue = self._ctx.Queue()
+        self._tool_conn, self._worker_tool_conn = self._ctx.Pipe()
         self._worker = self._spawn_worker()
+
+    def _serve_tool_requests(self) -> None:
+        """Answer any MCP tool calls the worker is waiting on, using the
+        real tool functions (and MCP connection) owned by this process."""
+        while self._tool_conn.poll():
+            try:
+                tool_name, kwargs = self._tool_conn.recv()
+            except (EOFError, OSError):
+                return  # worker died mid-request; execute() will notice
+            try:
+                reply = ("ok", self.mcp_tools[tool_name](**kwargs))
+            except Exception as e:
+                reply = ("error", f"Tool '{tool_name}' failed: {type(e).__name__}: {e}")
+            try:
+                self._tool_conn.send(reply)
+            except (BrokenPipeError, OSError):
+                return
 
     def execute(self, code: str) -> str:
         """Run `code` in the persistent worker and return what it printed
@@ -243,6 +293,7 @@ class Sandbox:
         over_memory_limit = False
         tick = 0
         while True:
+            self._serve_tool_requests()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
