@@ -125,19 +125,61 @@ class AgentLoop:
             if total_output_tokens > self.max_output_tokens:
                 return finish(False, "", f"Exceeded max output tokens ({self.max_output_tokens})")
 
-            messages.append({"role": "assistant", "content": response.text})
+                       # Some providers (e.g. Cohere) reject empty messages. A reasoning model
+            # can spend its whole output budget thinking and return no text at all,
+            # so never send an empty assistant message back.
+            messages.append({"role": "assistant", "content": response.text or "(empty response)"})
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
 
         return finish(False, "", f"Reached max iterations ({self.max_iterations}) without final_answer")
 
 
 def build_system_prompt(sandbox_manual: str, benchmark: str) -> str:
-    """STAGE 0: minimal prompt with format rules and one worked example."""
+    """Build the system prompt: format rules, available tools, and
+    benchmark-specific instructions with one worked example."""
     tools = sandbox_manual.strip() or "(no extra tools connected)"
+
+    if benchmark == "mbpp":
+        task_instructions = """For mbpp tasks:
+1. Write the requested function as a source-code string. Keep the exact
+   function name and parameters from the given signature.
+2. Check it with the official tests: print(run_tests(code=solution))
+3. If a test fails, fix the code and run the tests again.
+4. When all tests pass, submit the source string with final_answer(solution).
+Do not hard-code the expected outputs of the tests: implement the general
+logic described in the task, since hidden tests are also used for grading.
+
+Example
+-------
+Task: Write a function to find the square of a number.
+Function signature: def square(n):
+Tests:
+assert square(3) == 9
+
+Thought: I write the function and check it with the official tests.
+```python
+solution = '''def square(n):
+    return n * n
+'''
+print(run_tests(code=solution))
+```
+<end_code>
+Observation:
+[run_tests] 1/1 tests passed
+
+Thought: All tests pass, I submit the solution.
+```python
+final_answer(solution)
+```
+<end_code>
+"""
+    else:
+        task_instructions = f"For {benchmark} tasks: use the tools above to solve the task, then submit with final_answer."
+
     return f"""You are a coding agent that solves tasks by writing and running Python code.
 
 At each turn, write:
-Thought: your reasoning about what to do next
+Thought: one or two short sentences about what to do next
 ```python
 # code to run
 ```
@@ -148,6 +190,9 @@ Rules:
   Only what you print() is visible, so print the results you need.
 - Variables and functions you define persist between turns.
 - Never write the Observation yourself; stop after <end_code>.
+- Keep your answers short: your total output is limited.
+- exec(), eval() and compile() are not available.
+- Always call tools with keyword arguments, e.g. run_tests(code=solution).
 - When you are done, call final_answer(answer) inside a code block.
 
 Always available:
@@ -156,32 +201,4 @@ Always available:
 Other tools:
 {tools}
 
-For {benchmark} tasks: write the requested function as a source-code string, exec() it,
-check it against the given tests, then submit the source string with final_answer.
-
-Example
--------
-Task: Write a function to find the square of a number.
-Function signature: def square(n):
-Tests:
-assert square(3) == 9
-
-Thought: I will define the function as a string, run it and check the test.
-```python
-solution = '''def square(n):
-    return n * n
-'''
-exec(solution)
-assert square(3) == 9
-print("all tests passed")
-```
-<end_code>
-Observation:
-all tests passed
-
-Thought: The tests pass, I submit the solution.
-```python
-final_answer(solution)
-```
-<end_code>
-"""
+{task_instructions}"""

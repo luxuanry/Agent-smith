@@ -1,97 +1,153 @@
 """
-Sandbox security mechanisms (Section V.2, points 3 & 4).
+Sandbox security (Section V.2 points 3, 4).
 
-Four dimensions, all implemented:
-  1. Import restriction — only whitelisted modules can be imported   DONE
-  2. Filesystem restriction — only allowed_directories are reachable  DONE
-  3. Execution timeout — enforced in executor.py via signal.alarm     DONE
-  4. Memory limit — enforced in executor.py via resource.setrlimit    DONE
+Four things the sandbox has to hold up under `tests/test_sandbox_security.py`:
+  1. import allowlist    -- only whitelisted modules can be imported
+  2. path allowlist       -- file access restricted to allowed_directories
+  3. timeout               -- enforced by killing the worker process (executor.py)
+  4. memory limit          -- resource.setrlimit, applied here, called once when
+                              the worker process starts (executor.py)
 
-Standard library only (the PDF explicitly forbids third-party
-libraries like RestrictedPython).
+Only the standard library is used here (no third-party sandboxing libs).
 """
 from __future__ import annotations
 
-import builtins as _builtins_module
+import builtins
 import os
+import resource
 from typing import Iterable, Set
 
 
+def check_path_allowed(path: str, allowed_directories: Iterable[str]) -> bool:
+    """True if `path` resolves to somewhere inside one of `allowed_directories`.
+
+    `os.path.realpath` collapses `..`, symlinks and relative segments into a
+    clean absolute path first, so a trick like "/testbed/../../etc/passwd"
+    can't sneak past the string comparison below.
+    """
+    real_path = os.path.realpath(path)
+    for allowed in allowed_directories:
+        real_allowed = os.path.realpath(allowed)
+        if real_path == real_allowed or real_path.startswith(real_allowed + os.sep):
+            return True
+    return False
+
+
 class ImportGuard:
-    """Intercepts __import__, only allowing modules on the whitelist."""
+    """Intercepts `__import__`, only letting whitelisted modules through.
+
+    `authorized_imports` entries can be an exact module name ("math") or a
+    wildcard covering all of a package's submodules ("math.*").
+    """
 
     def __init__(self, authorized_imports: Iterable[str]):
         self.authorized: Set[str] = set(authorized_imports)
-        self._real_import = _builtins_module.__import__
+        self._real_import = builtins.__import__
 
     def _is_authorized(self, module_name: str) -> bool:
         if module_name in self.authorized:
             return True
         top_level = module_name.split(".")[0]
+        if top_level in self.authorized:
+            return True
         if f"{top_level}.*" in self.authorized:
             return True
         return False
 
     def guarded_import(self, name, globals=None, locals=None, fromlist=(), level=0):
         if not self._is_authorized(name):
-            raise ImportError(
-                f"[SANDBOX] Module '{name}' is not in the authorized_imports allowlist."
-            )
+            raise ImportError(f"Module '{name}' is not in the authorized imports allowlist")
         return self._real_import(name, globals, locals, fromlist, level)
 
     def install(self) -> None:
-        _builtins_module.__import__ = self.guarded_import
+        builtins.__import__ = self.guarded_import
 
     def uninstall(self) -> None:
-        _builtins_module.__import__ = self._real_import
-
-
-def check_path_allowed(path: str, allowed_directories: Iterable[str]) -> bool:
-    """Check whether `path` falls within one of allowed_directories.
-
-    Resolves ".." and symlinks first (os.path.realpath) to defend against
-    path traversal, and matches against the directory PLUS a trailing
-    separator so a look-alike neighbor like "/testbed_backup" is never
-    mistaken for being inside "/testbed".
-    """
-    real_path = os.path.realpath(path)
-    for allowed_dir in allowed_directories:
-        real_allowed = os.path.realpath(allowed_dir)
-        if real_path == real_allowed or real_path.startswith(real_allowed + os.sep):
-            return True
-    return False
+        builtins.__import__ = self._real_import
 
 
 def build_restricted_builtins(allowed_directories: Iterable[str]) -> dict:
-    """Return a copy of the builtins namespace with dangerous entries
-    removed or replaced by safe, checked versions.
+    """A copy of the normal builtins, with the dangerous ones removed or wrapped.
 
-    - eval / exec / compile: removed entirely. The sandbox itself uses its
-      own exec() call (in executor.py) to run the LLM's code, but code
-      RUNNING INSIDE the sandbox must not be able to call exec()/eval()
-      again -- that would let it build a string at runtime and execute it,
-      sidestepping the ImportGuard and the checked open() below.
-    - __import__: left out here on purpose; executor.py installs
-      ImportGuard.guarded_import in its place right after calling this
-      function, so import restriction stays in one place (security.py's
-      ImportGuard), not duplicated here.
-    - open: replaced with a version that checks the requested path against
-      `allowed_directories` (via check_path_allowed) before allowing it.
+    - `open` is replaced with a version that checks the path first.
+    - `eval` / `exec` / `compile` are removed: the sandbox itself needs `exec`
+      to run the LLM's code once, but the LLM's code should not be able to
+      call `exec`/`eval` again from inside to route around the guards above
+      (`ImportGuard` already covers plain `import` statements).
+    - `input` / `breakpoint` are removed: no interactive prompts from inside
+      untrusted code.
+    - `__import__` is intentionally left in place here; the caller (the
+      sandbox worker) overwrites it with the ImportGuard's guarded version.
+      The import statement needs *some* callable named __import__ to exist
+      in builtins, so removing it outright breaks even whitelisted imports.
     """
-    allowed_dirs = list(allowed_directories)
-    real_open = _builtins_module.open
+    safe_builtins = dict(vars(builtins))
+    real_open = builtins.open
 
-    def checked_open(file, mode="r", *args, **kwargs):
-        if not check_path_allowed(str(file), allowed_dirs):
-            raise PermissionError(
-                f"[SANDBOX] Path '{file}' is outside the allowed directories: {allowed_dirs}"
-            )
+    def guarded_open(file, mode="r", *args, **kwargs):
+        if not check_path_allowed(str(file), allowed_directories):
+            raise PermissionError(f"Access to path '{file}' is not allowed")
         return real_open(file, mode, *args, **kwargs)
 
-    safe_builtins = {
-        name: value
-        for name, value in vars(_builtins_module).items()
-        if name not in ("eval", "exec", "compile", "__import__")
-    }
-    safe_builtins["open"] = checked_open
+    safe_builtins["open"] = guarded_open
+
+    for name in ("eval", "exec", "compile", "input", "breakpoint"):
+        safe_builtins.pop(name, None)
+
     return safe_builtins
+
+
+def apply_memory_limit(max_memory_mb: int) -> None:
+    """Cap this process's total address space by lowering the SOFT
+    RLIMIT_AS only -- the hard limit is left untouched (usually
+    RLIM_INFINITY), specifically so a later `reset_memory_limit()` call can
+    raise the soft limit back up. Call this around the one thing that
+    actually needs capping (the worker's `exec(code, namespace)` call, see
+    sandbox/executor.py) -- never in the parent/agent process, and never
+    left on permanently in the worker (see reset_memory_limit below for why).
+
+    KNOWN LIMITATION: RLIMIT_AS is enforced reliably by the Linux kernel,
+    but is loosely enforced by the macOS (Darwin/XNU) kernel -- on Mac this
+    is a best-effort cap, not a guarantee. What still holds on Mac even if
+    this doesn't fire: since the sandboxed code now runs in its own worker
+    process (sandbox/executor.py), if the OS ends up OOM-killing that
+    process anyway, only the worker dies -- the agent loop and the rest of
+    the program keep running, and the crash is reported back as an
+    observation instead of taking the whole run down.
+    """
+    if max_memory_mb <= 0:
+        return  # 0 or negative means "no limit" -- don't call setrlimit(0)
+    limit_bytes = max_memory_mb * 1024 * 1024
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        new_soft = limit_bytes if hard == resource.RLIM_INFINITY else min(limit_bytes, hard)
+        resource.setrlimit(resource.RLIMIT_AS, (new_soft, hard))
+    except (ValueError, OSError):
+        # Some platforms/containers refuse to lower RLIMIT_AS at all.
+        # Don't crash the worker over it -- the process-level isolation
+        # (killable/OOM-killable independently of the parent) still holds.
+        pass
+
+
+def reset_memory_limit() -> None:
+    """Undo apply_memory_limit(): raise the soft RLIMIT_AS back up to the
+    (untouched) hard limit -- usually RLIM_INFINITY, i.e. no cap.
+
+    Why this exists: a tight memory cap (e.g. 128MB in tests) is barely
+    enough headroom for the user's own code, let alone the worker's OWN
+    bookkeeping between calls -- notably, `multiprocessing.Queue.put()`
+    lazily starts a background feeder thread on its first use, which needs
+    to mmap a new thread stack. On a real Linux kernel (which -- unlike
+    macOS -- actually enforces RLIMIT_AS) a fresh, fully-loaded, forked
+    CPython process can already be sitting close to a tight cap, and that
+    mmap fails with "RuntimeError: can't start new thread" -- not because
+    anything is actually leaking or wrong, just because the cap meant for
+    the sandboxed code was still in effect for the worker's own plumbing.
+    Calling this right after exec() finishes, before touching the result
+    queue, keeps the cap scoped to exactly the code it's meant to constrain.
+    """
+    try:
+        _, hard = resource.getrlimit(resource.RLIMIT_AS)
+        resource.setrlimit(resource.RLIMIT_AS, (hard, hard))
+    except (ValueError, OSError):
+        pass
