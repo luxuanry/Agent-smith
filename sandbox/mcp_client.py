@@ -66,7 +66,12 @@ class MCPClient:
         `command` example: "python mcp_tools_mbpp.py"
         """
         parts = command.split()
-        server_params = StdioServerParameters(command=parts[0], args=parts[1:])
+        # Pass the full environment explicitly: without `env`, the MCP SDK
+        # only forwards a small whitelist (PATH, HOME, ...) to the server
+        # subprocess, so variables like MBPP_TASK_FILE would be dropped.
+        server_params = StdioServerParameters(
+            command=parts[0], args=parts[1:], env=dict(os.environ)
+        )
 
         def run_loop():
             self._loop = asyncio.new_event_loop()
