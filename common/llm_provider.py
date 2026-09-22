@@ -68,6 +68,13 @@ class LLMProvider:
             "max_tokens": max_tokens,
             "temperature": 0,
         }
+        # Reasoning tokens count toward our output limit (Section VI.1), so ask
+        # the model to think as little as possible. Each provider uses its own
+        # parameter name for this.
+        if "openrouter.ai" in self.base_url:
+            payload["reasoning"] = {"enabled": False}
+        elif "googleapis.com" in self.base_url:
+            payload["reasoning_effort"] = "none"
         if stop_sequences:
             payload["stop"] = stop_sequences
 
