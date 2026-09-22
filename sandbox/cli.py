@@ -41,25 +41,25 @@ def load_config(config_file) -> SandboxConfig:
 
 
 def main(argv=None) -> None:
-    """
-    TODO(学生实现):
-    1. 解析参数（已经帮你搭好 parse_args）
-    2. 加载 SandboxConfig（已经帮你搭好 load_config）
-    3. 如果传了 --mcp-stdio 或 --mcp-server，用 MCPClient 连接并
-       discover_tools() + wrap_as_python_functions()
-    4. 用得到的 config + mcp_tools 构造 Sandbox 实例
-    5. 调用 sandbox.run_repl() 进入交互模式
-
-    别忘了：Ctrl+D (EOF) 或输入 "exit" 要能干净退出。
-    """
     args = parse_args(argv)
-    config = load_config(args.config_file)
-
+    if args.mcp_stdio and args.mcp_server:
+        sys.exit("error: --mcp-stdio and mcp-server cant be run together")
+    try:
+        config = load_config(args.config_file)
+    except FileNotFoundError:
+        sys.exit(f"error: cant find the file: {args.config_file}")
+    except json.JSONDecodeError as e:
+        sys.exit(f"error: JSON error: {e}")
+    except Exception as e:
+        sys.exit(f"error: config error: {e}")
+    
     mcp_tools = {}
-    # TODO: 根据 args.mcp_stdio / args.mcp_server 连接 MCP，填充 mcp_tools
-
+    # need to link with mcp
     sandbox = Sandbox(config=config, mcp_tools=mcp_tools)
-    sandbox.run_repl()
+    try:
+        sandbox.run_repl()
+    finally:
+        sandbox.shutdown()
 
 
 if __name__ == "__main__":

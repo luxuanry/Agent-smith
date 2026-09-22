@@ -76,4 +76,27 @@ def test_memory_limit_is_enforced(sandbox):
     assert "reached" not in output
 
 
+# def test_agent_path_only_shows_what_was_printed(sandbox):
+#     # execute() defaults to echo_last_expr=False, so an expression statement's
+#     # value is discarded no matter how the code happens to be shaped. The loop
+#     # is the case that matters: it's ONE top-level statement, so the old
+#     # "try single first" compile echoed every iteration's value into the
+#     # observation -- burning context for output the LLM never asked for.
+#     assert sandbox.execute("sorted([3, 1, 2])") == ""
+#     assert sandbox.execute("x = [3, 1, 2]\nsorted(x)") == ""
+#     assert sandbox.execute("for q in [1, 2, 3]:\n    str(q)") == ""
+#     # ...and print() still works, which is the only channel the LLM is told about.
+#     assert "2.0" in sandbox.execute("import math\nprint(math.sqrt(4))")
+
+
+# def test_repl_path_echoes_expression_values(sandbox):
+#     # run_repl() opts in to the interactive behavior, matching CPython's own
+#     # REPL: a bare expression shows its repr, nested statements included.
+#     assert sandbox.execute("sorted([3, 1, 2])", echo_last_expr=True) == "[1, 2, 3]\n"
+#     assert sandbox.execute("if True:\n    2 + 2", echo_last_expr=True) == "4\n"
+#     # Several statements at once (a paste) still runs -- it just can't echo,
+#     # since "single" rejects it and the "exec" fallback takes over.
+#     assert sandbox.execute("y = 5\nprint(y)", echo_last_expr=True) == "5\n"
+
+
 # TODO: MCP 协议相关的测试，等 mcp_client.py / mcp_tools_mbpp.py 写完之后再补
