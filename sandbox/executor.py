@@ -8,6 +8,10 @@ Responsibilities:
   2. execute(code) -> str : run code, capture stdout (the LLM only sees what it print()s)
   3. run_repl() : interactive mode for `uv run sandbox`
 
+  Re: point 2 -- "only sees what it print()s" is now literally true for the
+  agent path, and `run_repl()` is the one deliberate exception. See
+  _compile() for why that distinction has to be made explicitly.
+
 STAGE 4 (current): code now runs in a persistent CHILD PROCESS instead of
 being exec()'d directly inside the agent's own process. Why this changed:
 
@@ -52,7 +56,9 @@ Design:
   - One worker process per Sandbox instance, started in __init__ and kept
     alive across calls (`multiprocessing`, fork start method).
   - Two queues: code goes parent -> child (`_code_queue`), results come
-    child -> parent (`_result_queue`).
+    child -> parent (`_result_queue`). A `_code_queue` item is either the
+    `None` shutdown sentinel or a `(code, echo_last_expr)` tuple -- the
+    worker has to test for the sentinel BEFORE it unpacks.
   - The worker keeps its OWN `namespace` dict alive across calls (it lives
     in the child's memory, not the parent's), so a variable/function
     defined in step N is still there in step N+1 -- same externally
@@ -126,6 +132,57 @@ def _get_worker_rss_mb(pid: int) -> Optional[float]:
         return None
 
 
+def _compile(code: str, echo_last_expr: bool):
+    """Compile `code` for the worker, in the mode the CALLER asked for.
+
+    This used to always try "single" first and only fall back to "exec",
+    which quietly made the observation depend on the *shape* of the code
+    rather than on what it printed. "single" accepts exactly one TOP-LEVEL
+    statement, and for every expression statement it compiles at module
+    scope it emits PRINT_EXPR -- i.e. pushes that value through
+    sys.displayhook, which writes to sys.stdout, which is the buffer we
+    capture and hand back to the LLM. So:
+
+        sorted(x)                    -> 1 top-level stmt -> "single" -> echoed
+        x = [3,1,2]                  -> 2 top-level stmts -> "exec"  -> silent
+        sorted(x)
+
+        for q in queries:            -> 1 top-level stmt -> "single" -> EVERY
+            search(q)                   iteration's return value echoed
+
+    That last one is the one that actually bites: an LLM writing a plain
+    loop over tool calls, with no print() anywhere, dumps N reprs into the
+    observation and burns context for it -- while the same logic split
+    across two statements stays silent. Nothing leaks to the real terminal
+    (redirect_stdout catches displayhook fine); the damage is entirely in
+    what the LLM ends up reading.
+
+    So the mode is now the caller's decision:
+      - echo_last_expr=False (agent path, the default): "exec" only.
+        Expression values are discarded, and the docstring's promise that
+        the LLM only sees what it print()s actually holds.
+      - echo_last_expr=True (run_repl only): the old behavior, which for an
+        interactive prompt is not a bug but fidelity -- CPython's own REPL
+        echoes exactly this way, nested statements included.
+
+    The "exec" fallback stays on the echo path: pasting several statements
+    into the REPL at once gets past run_repl's codeop check (it raises
+    SyntaxError there, which run_repl treats as "complete, let the worker
+    report it"), so "single" can still legitimately fail here.
+    """
+    if not echo_last_expr:
+        return compile(code, "<sandbox>", "exec")
+    try:
+        return compile(code, "<sandbox>", "single")
+    except SyntaxError:
+        pass  # more than one top-level statement -- not REPL-shaped
+    # Deliberately outside the except block: by the time this runs the
+    # handler has exited, so a genuine syntax error raised here doesn't
+    # carry the (misleading) "single" error as its __context__ and
+    # traceback.format_exc() below shows just the real one.
+    return compile(code, "<sandbox>", "exec")
+
+
 def _worker_main(
     code_queue: "mp.Queue",
     result_queue: "mp.Queue",
@@ -164,24 +221,19 @@ def _worker_main(
 
     while True:
         try:
-            code = code_queue.get()
+            request = code_queue.get()
         except (KeyboardInterrupt, EOFError):
             break
-        if code is None:  # shutdown sentinel
+        if request is None:  # shutdown sentinel -- test BEFORE unpacking
             break
+        code, echo_last_expr = request
 
         stdout_buffer = io.StringIO()
         error: Optional[str] = None
         import_guard.install()
         apply_memory_limit(config.max_memory_mb)
         try:
-            try:
-                compiled = compile(code, "<sandbox>", "single")
-            except SyntaxError:
-                try:
-                    compiled = compile(code, "<sandbox>", "exec")
-                except SyntaxError as e:
-                    raise e from None
+            compiled = _compile(code, echo_last_expr)
             with contextlib.redirect_stdout(stdout_buffer):
                 exec(compiled, namespace)
         except (KeyboardInterrupt, SystemExit):
@@ -244,10 +296,19 @@ class Sandbox:
         self._result_queue = self._ctx.Queue()
         self._worker = self._spawn_worker()
 
-    def execute(self, code: str) -> str:
+    def execute(self, code: str, echo_last_expr: bool = False) -> str:
         """Run `code` in the persistent worker and return what it printed
-        (or the error/timeout/crash message)."""
-        self._code_queue.put(code)
+        (or the error/timeout/crash message).
+
+        `echo_last_expr` defaults to False on purpose: the agent path
+        (common/agent_loop.py) calls this with just the code, so the safe,
+        deterministic behavior is what it gets without having to ask. Only
+        run_repl() opts in. See _compile() for what it changes.
+
+        Note it rides along with each call rather than being worker state --
+        that's what keeps _restart_worker() free of anything to re-init.
+        """
+        self._code_queue.put((code, echo_last_expr))
 
         deadline = time.monotonic() + self.config.max_execution_time_seconds
         result: Optional[dict] = None
@@ -319,7 +380,9 @@ class Sandbox:
             buffer.clear()
 
             try:
-                output = self.execute(source)
+                # The one caller that wants expression values echoed back --
+                # that's what an interactive prompt is for.
+                output = self.execute(source, echo_last_expr=True)
             except KeyboardInterrupt:
                 print("\nKeyboardInterrupt")
                 continue
