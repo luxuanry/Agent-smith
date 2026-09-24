@@ -40,11 +40,13 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import threading
 from typing import Callable, Dict, Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
 
 
 class MCPClient:
@@ -65,18 +67,34 @@ class MCPClient:
 
         `command` example: "python mcp_tools_mbpp.py"
         """
-        parts = command.split()
+        # shlex (not str.split) so a quoted path with spaces stays one argument.
+        parts = shlex.split(command)
         # Pass the full environment explicitly: without `env`, the MCP SDK
         # only forwards a small whitelist (PATH, HOME, ...) to the server
         # subprocess, so variables like MBPP_TASK_FILE would be dropped.
         server_params = StdioServerParameters(
             command=parts[0], args=parts[1:], env=dict(os.environ)
         )
+        self._start(lambda: stdio_client(server_params))
+
+    def connect_http(self, url: str) -> None:
+        """Connect to an MCP server that is ALREADY running and listening
+        on `url` (streamable HTTP transport), e.g. "http://127.0.0.1:8000/mcp".
+
+        Unlike stdio, nothing is launched here: the server's lifetime is
+        independent of ours, so close() only ends our session with it.
+        """
+        self._start(lambda: streamable_http_client(url))
+
+    def _start(self, open_transport: Callable) -> None:
+        """Run the session lifecycle on a background event loop and block
+        until it is ready (or failed). Shared by both transports.
+        """
 
         def run_loop():
             self._loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self._loop)
-            self._loop.run_until_complete(self._session_lifecycle(server_params))
+            self._loop.run_until_complete(self._session_lifecycle(open_transport))
 
         self._thread = threading.Thread(target=run_loop, daemon=True)
         self._thread.start()
@@ -87,30 +105,35 @@ class MCPClient:
         if self._connect_error is not None:
             raise self._connect_error
 
-    async def _session_lifecycle(self, server_params: StdioServerParameters) -> None:
+    async def _session_lifecycle(self, open_transport: Callable) -> None:
         """Owns the ENTIRE lifetime of the connection: open, stay open
         while tool calls happen elsewhere, then close — all within this
         one task, which is what anyio's cancel-scope rule requires.
+
+        `open_transport()` returns the transport's async context manager.
+        This is the ONLY part that differs between stdio and HTTP: both
+        yield a (read, write, ...) tuple of streams — HTTP adds a third
+        item, a session-id getter we don't need — and everything after
+        that (ClientSession, initialize, list_tools, call_tool) is the same.
         """
         self._stop_event = asyncio.Event()
         try:
-            async with stdio_client(server_params) as (read, write):
+            async with open_transport() as streams:
+                read, write = streams[0], streams[1]
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     self._session = session
-                    self._ready.set()  # connect_stdio() can now return
+                    self._ready.set()  # connect_*() can now return
                     await self._stop_event.wait()  # keep the session open until close() is called
         except BaseException as e:
+            # anyio wraps failures in an ExceptionGroup ("unhandled errors in
+            # a TaskGroup"); unwrap single-error groups to show the real cause.
+            while len(getattr(e, "exceptions", ())) == 1:
+                e = e.exceptions[0]
             self._connect_error = e
             self._ready.set()
         finally:
             self._session = None
-
-    def connect_http(self, url: str) -> None:
-        """TODO: implement when an HTTP-based MCP server is needed
-        (Section V.2 requires supporting both stdio and HTTP transports).
-        """
-        raise NotImplementedError("TODO: HTTP transport")
 
     # ------------------------------------------------------------------
     # Discovering and wrapping tools

@@ -21,6 +21,7 @@ import sys
 
 from common.models import SandboxConfig
 from sandbox.executor import Sandbox
+from sandbox.manual import generate_sandbox_manual
 from sandbox.mcp_client import MCPClient
 
 
@@ -53,13 +54,30 @@ def main(argv=None) -> None:
     except Exception as e:
         sys.exit(f"error: config error: {e}")
     
+    # stdio: we launch the server ourselves. HTTP: it must already be running.
+    mcp_client = MCPClient()
     mcp_tools = {}
-    # need to link with mcp
-    sandbox = Sandbox(config=config, mcp_tools=mcp_tools)
+    if args.mcp_stdio or args.mcp_server:
+        try:
+            if args.mcp_stdio:
+                mcp_client.connect_stdio(args.mcp_stdio)
+            else:
+                mcp_client.connect_http(args.mcp_server)
+            mcp_client.discover_tools()
+        except Exception as e:
+            mcp_client.close()
+            sys.exit(f"error: cant connect to MCP server: {type(e).__name__}: {e}")
+        mcp_tools = mcp_client.wrap_as_python_functions()
+        print(generate_sandbox_manual(mcp_client.tools))
+
     try:
-        sandbox.run_repl()
+        sandbox = Sandbox(config=config, mcp_tools=mcp_tools)
+        try:
+            sandbox.run_repl()
+        finally:
+            sandbox.shutdown()
     finally:
-        sandbox.shutdown()
+        mcp_client.close()
 
 
 if __name__ == "__main__":

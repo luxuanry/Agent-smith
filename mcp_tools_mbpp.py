@@ -68,6 +68,9 @@ def run_tests(code: str) -> str:
     try:
         proc = subprocess.run(
             [sys.executable, "-c", script],
+            # Don't inherit our stdin: under the stdio transport it is the
+            # MCP pipe, and the tested code must not read (or block on) it.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=TEST_TIMEOUT_SECONDS,
@@ -82,4 +85,20 @@ def run_tests(code: str) -> str:
 
 
 if __name__ == "__main__":
-    mcp.run()
+    # Default: stdio (the client launches us). With --http we run as a
+    # standalone server that clients connect to by URL:
+    #   python mcp_tools_mbpp.py --http --port 8000  ->  http://127.0.0.1:8000/mcp
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true", help="serve over streamable HTTP instead of stdio")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args = parser.parse_args()
+
+    if args.http:
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        mcp.run(transport="streamable-http")
+    else:
+        mcp.run()
