@@ -24,11 +24,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 
 from common.agent_loop import AgentLoop, build_system_prompt
+from common.docker_env import cleanup_container, container_name, pull_image, start_container
 from common.env import load_env_file
 from common.llm_provider import LLMProvider
 from common.models import SandboxConfig, SolutionOutput, SWEBenchTaskInput
@@ -69,58 +69,28 @@ def build_user_task(task: SWEBenchTaskInput) -> str:
     return "\n\n".join(parts)
 
 
-def _container_name(instance_id: str) -> str:
-    """Docker container names must match [a-zA-Z0-9][a-zA-Z0-9_.-]*.
-    SWE-bench instance_ids (e.g. 'sympy__sympy-14711') already satisfy that;
-    we just namespace them so they don't collide with unrelated containers
-    on the host."""
-    return f"agent-smith-{instance_id}"
-
-
-def _docker_pull(image: str) -> None:
-    subprocess.run(["docker", "pull", image], check=True)
-
-
-def _docker_start_container(image: str, name: str) -> None:
-    # Best-effort: remove any stale container left over from a previous
-    # crashed run before starting a fresh one under the same name.
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
-    subprocess.run(
-        ["docker", "run", "-dit", "--name", name, image, "/bin/bash"],
-        check=True,
-    )
-
-
-def _docker_cleanup(name: str) -> None:
-    """Stop + remove the task container. Best-effort and must never raise --
-    this runs after we've already written the solution to disk, and a
-    cleanup failure should never cost us a result we already have."""
-    subprocess.run(["docker", "stop", name], capture_output=True)
-    subprocess.run(["docker", "rm", name], capture_output=True)
-
-
 def main(argv=None) -> None:
     args = parse_args(argv)
     load_env_file(".env")
     start = time.perf_counter()
     task_id = "unknown"
     mcp_client = MCPClient()
-    container_name: str | None = None
+    container: str | None = None
 
     try:
         with open(args.task_file, encoding="utf-8") as f:
             task = SWEBenchTaskInput(**json.load(f))
         task_id = task.instance_id
 
-        container_name = _container_name(task.instance_id)
-        _docker_pull(task.docker_image)
-        _docker_start_container(task.docker_image, container_name)
+        container = container_name(task.instance_id)
+        pull_image(task.docker_image)
+        start_container(task.docker_image, container)
 
         # mcp_tools_swebench.py needs to know which container to `docker
         # exec` into, and where the task file (eval_script, repo, ...) is --
         # same idea as MBPP_TASK_FILE in agent_mbpp/__main__.py.
         os.environ[TASK_FILE_ENV] = args.task_file
-        os.environ[CONTAINER_NAME_ENV] = container_name
+        os.environ[CONTAINER_NAME_ENV] = container
 
         mcp_client.connect_stdio("python mcp_tools_swebench.py")
         mcp_client.discover_tools()
@@ -170,8 +140,8 @@ def main(argv=None) -> None:
     except Exception as e:
         print(f"[warning] MCP client cleanup failed: {type(e).__name__}: {e}", file=sys.stderr)
 
-    if container_name is not None:
-        _docker_cleanup(container_name)
+    if container is not None:
+        cleanup_container(container)
 
 
 if __name__ == "__main__":
