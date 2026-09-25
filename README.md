@@ -41,11 +41,62 @@ uv run python -m agent_mbpp --task-file cache/mbpp_task.json \
 ### Running the SWE-bench agent
 ```bash
 cd moulinette
-uv run moulinette_eval dump swebench --output ../cache/swebench_task.json
+uv run moulinette_eval dump swebench --task-id sympy__sympy-14711 --output ../cache/swebench_task.json
 cd ..
 uv run python -m agent_swebench --task-file cache/swebench_task.json \
     --output cache/swebench_solution.json \
     --model-name "TODO" --provider-url "TODO"
+cd moulinette
+uv run moulinette_eval validate swebench ../cache/swebench_task.json ../cache/swebench_solution.json
+```
+
+Leave off `--task-id` to dump a random instance instead of a fixed one.
+
+> **Status:** the `dump` step above already works. `agent_swebench/__main__.py`
+> and `mcp_tools_swebench.py` are not implemented yet (both currently
+> `raise NotImplementedError`), so the `agent_swebench` and `validate` steps
+> don't run yet -- see below for exploring a task by hand in the meantime.
+
+### Exploring a SWE-bench container by hand
+
+Before the 9 MCP tools are wired up, it's worth pulling one task's image and
+poking around inside it manually -- this is the same thing
+`mcp_tools_swebench.py`'s tools will eventually do via `docker exec`, just
+typed by hand instead of called by the agent.
+
+Requires Docker Desktop running. The image name comes from the
+`docker_image` field of the dumped task JSON and is different per
+`instance_id` -- using `sympy__sympy-14711` as the running example below.
+
+```bash
+# 1. pull the instance's image (first pull can take a few minutes)
+docker pull swebench/sweb.eval.x86_64.sympy_1776_sympy-14711:latest
+
+# 2. start it detached -- the trailing /bin/bash is what keeps it alive
+docker run -dit --name sympy-14711 \
+    swebench/sweb.eval.x86_64.sympy_1776_sympy-14711:latest \
+    /bin/bash
+
+# 3. confirm it's up (should show sympy-14711, status Up)
+docker ps
+
+# 4. step inside -- prompt changes to something like root@<id>:/# once you're in
+docker exec -it sympy-14711 /bin/bash
+
+# --- now inside the container ---
+cd /testbed
+ls
+git log -1        # one synthetic "SWE-bench" commit, not the real project history
+git status
+source /opt/miniconda3/bin/activate
+conda activate testbed
+# poke around, try reproducing the bug from problem_statement, etc.
+exit
+# --- back on the host ---
+
+# 5. clean up -- don't skip this, an unremoved container just sits there
+docker stop sympy-14711
+docker rm sympy-14711
 ```
 
 ## System Architecture
