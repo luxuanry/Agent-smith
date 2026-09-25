@@ -173,6 +173,74 @@ final_answer(solution)
 ```
 <end_code>
 """
+    elif benchmark == "swebench":
+        task_instructions = """For swebench tasks:
+IMPORTANT: this code runs on your host machine, not inside the task's
+container. The target repository (e.g. sympy) is not installed here and
+cannot be imported or run directly -- `import sympy` (or any target-repo
+package) will fail even if it were on the allowlist, because the package
+simply isn't there. Never write code that imports or executes the repo's
+own code to "try it out" yourself. Everything that touches the actual
+repository -- reading files, searching code, running commands, running
+tests -- must go through the tools above; they are the only thing
+connected to the container.
+1. Read the issue below, then explore the repo with the tools above
+   (list_files / search_code / search_function_or_class_definition_in_code /
+   find_references / read_file) to find the code causing it.
+2. Make the fix with edit_file. old_str must match the current file content
+   exactly and uniquely -- read the file again if a call fails or matches
+   more than once.
+3. Verify with run_tests(). If it fails, keep editing and re-running
+   run_tests() until it passes, or you understand why it still can't.
+4. When done, call get_patch() to get the diff of your changes, then submit
+   it as-is with final_answer(patch). Never write the diff text yourself --
+   only submit exactly what get_patch() returned.
+Explore before you edit: read enough of the surrounding code to understand
+what you're changing, and only touch what's needed to fix the issue.
+
+Example
+-------
+Issue: Vector.__add__ raises when adding the zero vector.
+
+Thought: I look for the Vector class definition first.
+```python
+print(search_function_or_class_definition_in_code(name="Vector"))
+```
+<end_code>
+Observation:
+/testbed/sympy/physics/vector/vector.py:20 class Vector:
+
+Thought: I read the __add__ method in that area.
+```python
+print(read_file(filepath="/testbed/sympy/physics/vector/vector.py", start_line=1, end_line=60))
+```
+<end_code>
+Observation:
+   ...
+   45      def __add__(self, other):
+   46          return Vector(self.args + other.args)
+   ...
+
+Thought: I fix it to special-case zero, then re-run the tests.
+```python
+print(edit_file(
+    filepath="/testbed/sympy/physics/vector/vector.py",
+    old_str="    def __add__(self, other):\n        return Vector(self.args + other.args)",
+    new_str="    def __add__(self, other):\n        if other == 0:\n            return self\n        return Vector(self.args + other.args)",
+))
+print(run_tests())
+```
+<end_code>
+Observation:
+[run_tests] tests passed
+
+Thought: Tests pass, I get the diff and submit it.
+```python
+patch = get_patch()
+final_answer(patch)
+```
+<end_code>
+"""
     else:
         task_instructions = f"For {benchmark} tasks: use the tools above to solve the task, then submit with final_answer."
 
