@@ -1,18 +1,25 @@
 """
-Bridge between the SWE-bench MCP tools (mcp_tools_swebench.py) and the
-task's Docker container (Section V.4 + V.5).
+Shared infrastructure for the SWE-bench MCP tools (swebench_tools/*).
 
-Every one of the 9 mandatory tools needs to know two things: which
-container to `docker exec` into, and which task it's serving (eval_script,
-repo, instance_id, ...). This module resolves both and provides the single
-`docker_exec()` primitive every tool is built on top of, plus a couple of
-small helpers (`to_abs`, `truncate`) that most tool implementations will
-want.
+Every tool in fs_tools.py / search_tools.py / exec_tools.py needs two
+things: which container to `docker exec` into, and which task it's serving
+(eval_script, repo, instance_id, ...). This module resolves both and
+provides docker_exec(), the single primitive every tool is built on top of,
+plus the shared conventions the whole swebench_tools package follows:
 
-Settings are resolved in this priority order:
+  - Tools never raise. mcp_tools_swebench.py wraps every registered tool in
+    never_raise() below, so any exception (a bug, a misconfigured
+    container/task from get_container()/get_task(), ...) comes back to the
+    LLM as "[error] <reason>" instead of crashing the MCP server.
+  - Paths: a relative path is resolved against /testbed (see to_abs());
+    whatever a tool outputs should use absolute paths.
+  - Long output goes through truncate() before being returned -- except
+    get_patch(), which must return the complete, unmodified diff (a
+    truncated patch is a broken patch).
+
+Settings (which container, which task) are resolved in this priority order:
   1. --container / --task-file command-line flags, if mcp_tools_swebench.py
-     was launched with them directly. Only useful for manual testing --
-     see the bottom of this file for how.
+     was launched with them directly. Only useful for manual testing.
   2. SWEBENCH_CONTAINER_NAME / SWEBENCH_TASK_FILE environment variables.
      This is the real path: agent_swebench/__main__.py sets these before
      spawning mcp_tools_swebench.py, and the sandbox CLI's own
@@ -21,18 +28,19 @@ Settings are resolved in this priority order:
   3. DEFAULT_CACHE_TASK_FILE (cache/swebench_task.json, moulinette's default
      dump path) plus a container name derived from that task's instance_id
      via common.docker_env.container_name() -- lets you test the tools in
-     this file standalone against a container you started by hand, without
-     running the full agent_swebench pipeline first.
+     this package standalone against a container you started by hand,
+     without running the full agent_swebench pipeline first.
 """
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import os
 import posixpath
 import subprocess
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 from common.docker_env import container_name as _derive_container_name
 
@@ -62,6 +70,27 @@ class ExecResult:
     stdout: str
     stderr: str
     timed_out: bool
+
+
+def never_raise(fn: Callable[..., str]) -> Callable[..., str]:
+    """Tool-registration wrapper: catches anything fn raises and turns it
+    into a "[error] <type>: <message>" string instead of letting the
+    exception reach the MCP protocol layer. Every tool registered in
+    mcp_tools_swebench.py goes through this, so no individual tool
+    implementation has to remember to add its own top-level try/except for
+    infrastructure failures (e.g. get_container()/get_task() raising on a
+    missing task file). A tool can still return its own more specific
+    "[error] ..." string for a domain-specific failure (edit_file's old_str
+    not found, say) -- this wrapper is only the last-resort safety net."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            return f"[error] {type(e).__name__}: {e}"
+
+    return wrapper
 
 
 def _parse_cli_args() -> argparse.Namespace:
@@ -126,8 +155,8 @@ def truncate(text: str) -> str:
     to the LLM (V.1 feedback (4)). Keeps a head and a tail instead of just
     hard-cutting from the start -- the command that produced the output is
     usually at the top, the error is usually at the bottom -- and always
-    says explicitly how much was cut. The LLM should never have to guess
-    whether it's looking at the whole output."""
+    says explicitly how much was cut. Do NOT call this on get_patch()'s
+    output: a truncated diff is a broken patch, not a shortened one."""
     if len(text) <= TRUNCATE_MAX_CHARS:
         return text
     omitted = len(text) - TRUNCATE_HEAD_CHARS - TRUNCATE_TAIL_CHARS
@@ -143,11 +172,12 @@ def docker_exec(
     input: Optional[str] = None,
 ) -> ExecResult:
     """Run `command` inside the current task's container via `docker exec`,
-    optionally feeding it `input` on stdin. Never raises: a timeout, a
-    nonzero exit code, or anything docker itself prints to stderr all come
-    back as a normal ExecResult for the caller to inspect and report to the
-    LLM -- only a genuine setup problem (e.g. no container configured at
-    all, see get_container()) is still allowed to raise.
+    optionally feeding it `input` on stdin. Never raises for a command
+    failure: a timeout, a nonzero exit code, or anything docker itself
+    prints to stderr all come back as a normal ExecResult for the caller to
+    inspect -- only a genuine setup problem (no container configured at
+    all, see get_container()) is still allowed to raise, and that gets
+    caught by never_raise() at the tool-registration layer instead.
 
     Runs through `bash -lc` because each `docker exec` call is a brand new
     process -- it does NOT remember a previous call's
@@ -192,18 +222,3 @@ def docker_exec(
             stderr=(e.stderr or "") + f"\n[docker_exec] timed out after {timeout}s",
             timed_out=True,
         )
-
-
-if __name__ == "__main__":
-    # Quick manual smoke test, independent of the MCP server:
-    #   python docker_bridge.py
-    # Resolves settings the same way the real tools would (tier 2 or 3
-    # above) and runs one harmless command in the container, so you can
-    # check this module in isolation before wiring it into
-    # mcp_tools_swebench.py's tools.
-    print("container:", get_container())
-    print("task instance_id:", get_task().get("instance_id"))
-    r = docker_exec("echo hello from docker_bridge && pwd")
-    print("returncode:", r.returncode, "timed_out:", r.timed_out)
-    print("stdout:", r.stdout.strip())
-    print("stderr:", r.stderr.strip())
