@@ -365,7 +365,7 @@ class Sandbox:
         over_memory_limit = False
         tick = 0
         while True:
-            self._serve_tool_requests()
+            self._serve_tool_requests() #checking mcp tool request
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
