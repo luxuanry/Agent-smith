@@ -165,6 +165,23 @@ def truncate(text: str) -> str:
     return f"{head}\n[... {omitted} characters omitted ...]\n{tail}"
 
 
+# The container runtime prints its own chatter on every single call
+# (podman stands in for docker on the 42 machines and announces itself each
+# time); it is noise in every observation the LLM sees.
+_RUNTIME_NOISE = ("Emulate Docker CLI using podman",)
+
+
+def clean_stderr(stderr: str) -> str:
+    """Drop the container runtime's own messages from a command's stderr,
+    so a tool reports what the command said and nothing else."""
+    kept = [
+        line
+        for line in (stderr or "").splitlines()
+        if not any(noise in line for noise in _RUNTIME_NOISE)
+    ]
+    return "\n".join(kept).strip()
+
+
 def docker_exec(
     command: str,
     workdir: str = REPO_DIR,
@@ -200,7 +217,10 @@ def docker_exec(
     shell.
     """
     container = get_container()
-    full_cmd = ["docker", "exec", "-w", workdir, container, "bash", "-lc", command]
+    # -i keeps stdin attached: without it docker closes the container
+    # process's stdin, so anything passed as `input` never arrives.
+    stdin_flag = ["-i"] if input is not None else []
+    full_cmd = ["docker", "exec", *stdin_flag, "-w", workdir, container, "bash", "-lc", command]
     try:
         result = subprocess.run(
             full_cmd,
