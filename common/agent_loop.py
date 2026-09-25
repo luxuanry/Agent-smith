@@ -175,6 +175,15 @@ final_answer(solution)
 """
     elif benchmark == "swebench":
         task_instructions = """For swebench tasks:
+IMPORTANT: this code runs on your host machine, not inside the task's
+container. The target repository (e.g. sympy) is not installed here and
+cannot be imported or run directly -- `import sympy` (or any target-repo
+package) will fail even if it were on the allowlist, because the package
+simply isn't there. Never write code that imports or executes the repo's
+own code to "try it out" yourself. Everything that touches the actual
+repository -- reading files, searching code, running commands, running
+tests -- must go through the tools above; they are the only thing
+connected to the container.
 1. Read the issue below, then explore the repo with the tools above
    (list_files / search_code / search_function_or_class_definition_in_code /
    find_references / read_file) to find the code causing it.
