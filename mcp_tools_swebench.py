@@ -57,17 +57,40 @@ def _exit_on_sigterm(signum, frame):
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     sys.exit(0)
 
-def _exit_when_orphanded(parent_pid: int) -> None:
+def _exit_when_orphaned(parent_pid: int) -> None:
     while os.getppid() == parent_pid:
         time.sleep(1)
     cleanup_container()
-    os.exit(0)
+    os._exit(0)
 
 if __name__ == "__main__":
+    # Default: stdio (the client launches us). With --http we run as a
+    # standalone server that clients connect to by URL -- same flags as
+    # mcp_tools_mbpp.py:
+    #   python mcp_tools_swebench.py --http --port 8000 --task-file cache/swebench_task.json
+    #   -> http://127.0.0.1:8000/mcp
+    # parse_known_args, not parse_args: --container / --task-file belong to
+    # docker_bridge's own parser, so they must pass through untouched here.
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true", help="serve over streamable HTTP instead of stdio")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    args, _unknown = parser.parse_known_args()
+
     signal.signal(signal.SIGTERM, _exit_on_sigterm)
-    threading.Thread(target=_exit_when_orphanded, args=(os.getppid(),),daemon=True).start()
+    threading.Thread(target=_exit_when_orphaned, args=(os.getppid(),),daemon=True).start()
     try:
         prepare_container()
-        mcp.run()
+        if args.http:
+            # uvicorn takes over SIGINT/SIGTERM while serving, then restores
+            # our handlers and re-raises the signal on shutdown -- so Ctrl+C
+            # still ends up in the finally below and removes the container.
+            mcp.settings.host = args.host
+            mcp.settings.port = args.port
+            mcp.run(transport="streamable-http")
+        else:
+            mcp.run()
     finally:
         cleanup_container()
