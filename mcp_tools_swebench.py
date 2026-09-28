@@ -14,9 +14,20 @@ Each tool is wrapped in never_raise() before being registered, so a bug or
 an infrastructure failure (e.g. a misconfigured container) comes back to
 the LLM as a "[error] ..." string instead of crashing this server.
 """
+import os
+import signal
+import sys
+import threading
+import time
+
 from mcp.server.fastmcp import FastMCP
 
-from swebench_tools.docker_bridge import never_raise
+from swebench_tools.docker_bridge import (
+    cleanup_container,
+    never_raise,
+    prepare_container,
+)
+
 from swebench_tools.exec_tools import get_patch, run_command, run_tests
 from swebench_tools.fs_tools import edit_file, list_files, read_file
 from swebench_tools.search_tools import (
@@ -42,6 +53,21 @@ _TOOLS = (
 for _fn in _TOOLS:
     mcp.tool()(never_raise(_fn))
 
+def _exit_on_sigterm(signum, frame):
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    sys.exit(0)
+
+def _exit_when_orphanded(parent_pid: int) -> None:
+    while os.getppid() == parent_pid:
+        time.sleep(1)
+    cleanup_container()
+    os.exit(0)
 
 if __name__ == "__main__":
-    mcp.run()
+    signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    threading.Thread(target=_exit_when_orphanded, args=(os.getppid(),),daemon=True).start()
+    try:
+        prepare_container()
+        mcp.run()
+    finally:
+        cleanup_container()
