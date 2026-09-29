@@ -16,6 +16,7 @@ risk.
 from __future__ import annotations
 
 import subprocess
+import sys
 
 # Official SWE-bench images are built for x86_64 (the image name itself says
 # so: swebench/sweb.eval.x86_64...). On an Apple Silicon dev machine, not
@@ -38,17 +39,30 @@ def container_name(instance_id: str) -> str:
     containers on the host."""
     return f"agent-smith-{instance_id}"
 
+def qualify_image(image: str) -> str:
+    first = image.split("/", 1)[0]
+    if "/" in image and ("." in first or ":" in first or first == "localhost"):
+        return image
+    return f"docker.io/{image}"
 
 def pull_image(image: str) -> None:
     """Pull the image the task needs. Lets the exception propagate on
     failure -- if the image can't be pulled, nothing downstream can work
     either, so there's no point making this best-effort."""
-    subprocess.run(["docker", "pull", "--platform", DOCKER_PLATFORM, image], check=True)
+    image = qualify_image(image)
+    if subprocess.run(["docker", "image", "inspect", image], capture_output=True).returncode == 0:
+        return
+    subprocess.run(
+        ["docker", "pull", "--platform", DOCKER_PLATFORM, image],
+        check=True,
+        stdout=sys.stderr,
+    )
 
 
 def start_container(image: str, name: str) -> None:
     """Start a detached container running /bin/bash so it stays alive;
     every MCP tool later reaches into this container via `docker exec`."""
+    image = qualify_image(image)
     # Best-effort: force-remove any stale container left over from a
     # previous crashed run before starting a fresh one under the same
     # name. Deliberately not check=True -- the container most likely
@@ -63,6 +77,7 @@ def start_container(image: str, name: str) -> None:
             image, "/bin/bash",
         ],
         check=True,
+        stdout=sys.stderr,
     )
 
 

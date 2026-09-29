@@ -39,17 +39,18 @@ import json
 import os
 import posixpath
 import subprocess
+import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 from common.docker_env import container_name as _derive_container_name
+from common.docker_env import pull_image, start_container
 
 TASK_FILE_ENV = "SWEBENCH_TASK_FILE"
 CONTAINER_NAME_ENV = "SWEBENCH_CONTAINER_NAME"
 
 REPO_DIR = "/testbed"  # SWE-bench images always check the repo out here
 DEFAULT_TIMEOUT_SECONDS = 120
-DEFAULT_CACHE_TASK_FILE = "cache/swebench_task.json"  # moulinette's default dump path
 
 # truncate() thresholds, in characters (not lines -- a single line, e.g. a
 # stack trace, can be huge on its own). Keep a chunk from the start (what
@@ -106,37 +107,69 @@ def _parse_cli_args() -> argparse.Namespace:
 
 _CLI_ARGS = _parse_cli_args()
 
+_owned_container: Optional[str] = None
+_container_error: Optional[str] = None
+
+def _task_file() -> Optional[str]:
+    return _CLI_ARGS.task_file or os.environ.get(TASK_FILE_ENV)
+
+def _given_container() -> Optional[str]:
+    return _CLI_ARGS.container or os.environ.get(CONTAINER_NAME_ENV)
 
 def get_task() -> dict:
-    """Resolve the current task's JSON (docker_image / eval_script / repo /
-    instance_id / ...)."""
-    task_file = _CLI_ARGS.task_file or os.environ.get(TASK_FILE_ENV) or DEFAULT_CACHE_TASK_FILE
-    if not os.path.exists(task_file):
+    task_file = _task_file()
+    if not task_file:
         raise RuntimeError(
-            f"Task file not found: {task_file!r}. mcp_tools_swebench.py is "
-            f"normally started by agent_swebench/__main__.py, which sets "
-            f"{TASK_FILE_ENV} before spawning it. For standalone testing, "
-            f"either set that env var yourself, pass --task-file, or dump "
-            f"a task to {DEFAULT_CACHE_TASK_FILE!r} (moulinette's default)."
+            f"No task file configured. Pass --task-file to "
+            f"mcp_tools_swebench.py or set {TASK_FILE_ENV}."
         )
+    if not os.path.exists(task_file):
+        raise RuntimeError(f"Task file not found: {task_file!r}")
     with open(task_file, encoding="utf-8") as f:
         return json.load(f)
 
-
 def get_container() -> str:
-    """Resolve which container this process should `docker exec` into."""
-    if _CLI_ARGS.container:
-        return _CLI_ARGS.container
-    container = os.environ.get(CONTAINER_NAME_ENV)
+    container = _given_container() or _owned_container
     if container:
         return container
-    # Fallback: derive the name the same way agent_swebench/__main__.py
-    # does, from whatever task get_task()'s own fallback resolves to. Only
-    # works if you already started a container by hand under that exact
-    # name (see common.docker_env.container_name / start_container).
-    task = get_task()
-    return _derive_container_name(task["instance_id"])
+    if _container_error:
+        raise RuntimeError(f"Could not start the task container: {_container_error}")
+    raise RuntimeError(
+        f"No container configured. Either pass --container / set "
+        f"{CONTAINER_NAME_ENV} to use a running container, or pass "
+        f"--task-file / set {TASK_FILE_ENV} to have the server start (and clean up its own)."
+    )
 
+def prepare_container() -> None:
+    global _owned_container, _container_error
+    if _given_container() or not _task_file():
+        return
+    try:
+        task = get_task()
+        name = f"{_derive_container_name(task['instance_id'])}-mcp-{os.getpid()}"
+        _owned_container = name
+        print(f"[mcp_tools_swebench] starting container {name} ...", file=sys.stderr)
+        pull_image(task["docker_image"])
+        start_container(task["docker_image"], name)
+    except Exception as e:
+        _container_error = f"{type(e).__name__}: {e}"
+        cleanup_container()
+
+def cleanup_container() -> None:
+    global _owned_container
+    name, _owned_container = _owned_container, None
+    if name is None:
+        return
+    try:
+        for cmd in (["docker", "kill", name], ["docker", "rm", "-f", name]):
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=30,
+                start_new_session=True,
+            )
+    except Exception as e:
+        print(f"[mcp_tools_swebench] clean up of {name} failed: {e}", file=sys.stderr)
 
 def to_abs(path: str) -> str:
     """Resolve a filepath the LLM gave us to an absolute path inside the
@@ -147,7 +180,7 @@ def to_abs(path: str) -> str:
     on."""
     if posixpath.isabs(path):
         return path
-    return posixpath.join(REPO_DIR, path)
+    return posixpath.normpath(posixpath.join(REPO_DIR,path))
 
 
 def truncate(text: str) -> str:
