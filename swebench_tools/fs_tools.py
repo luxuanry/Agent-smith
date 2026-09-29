@@ -2,7 +2,7 @@
 import json
 import shlex
 
-from swebench_tools.docker_bridge import docker_exec, to_abs, truncate
+from swebench_tools.docker_bridge import clean_stderr, docker_exec, to_abs, truncate
 
 TESTBED_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"
 
@@ -94,13 +94,13 @@ def read_file(filepath: str, start_line: int, end_line: int) -> str:
         f"awk {shlex.quote(awk_prog)} {quoted}"
     )
     if result.returncode == _PAST_EOF_EXIT:
-        total = result.stderr.strip()
+        total = clean_stderr(result.stderr)
         return (
             f"[error] {path} has only {total} lines; start_line={start_line} "
             f"is past the end of the file."
         )
     if result.returncode != 0:
-        return f"[error] Cannot read {path}: {result.stderr.strip()}"
+        return f"[error] Cannot read {path}: {clean_stderr(result.stderr)}"
     return truncate(result.stdout.rstrip("\n"))
 
 
@@ -126,7 +126,7 @@ def edit_file(filepath: str, old_str: str, new_str: str) -> str:
         input=payload,
     )
     if result.returncode != 0:
-        return f"[error] edit_file failed on {path}: {(result.stderr or result.stdout).strip()}"
+        return f"[error] edit_file failed on {path}: {clean_stderr(result.stderr) or result.stdout.strip()}"
     return truncate(result.stdout.rstrip("\n"))
 
 
@@ -141,7 +141,7 @@ def list_files(directory: str, pattern: str) -> str:
         f"find {quoted} -name .git -prune -o -type f -name {shlex.quote(pattern)} -print | sort"
     )
     if result.returncode != 0:
-        return f"[error] Cannot list {path}: {result.stderr.strip()}"
+        return f"[error] Cannot list {path}: {clean_stderr(result.stderr)}"
     if not result.stdout.strip():
         return f"No files matching {pattern!r} under {path}."
     return truncate(result.stdout.rstrip("\n"))
