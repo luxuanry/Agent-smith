@@ -87,6 +87,16 @@ MCP tools and the worker process:
   call made while the memory cap is active can't fail with
   "can't start new thread" (the Queue problem described above).
 
+  Timeout independence: a tool call's own duration must not count
+  against the sandbox's max_execution_time_seconds (Section V.2: MCP
+  actions "are not subject to the sandbox timeout"). execute()'s
+  deadline is pushed forward by however long _serve_tool_requests()
+  just spent actually running a tool, so waiting on e.g. SWE-bench's
+  run_tests (which can legitimately take far longer than a quick
+  sandbox computation) doesn't eat into the code-execution budget.
+  The tool call itself is still bounded -- by its own timeout (e.g.
+  docker_exec's), not by this one.
+
 Import restriction:
   The ImportGuard is installed only in the sandbox namespace's own
   __builtins__ (see _worker_main), NOT globally with install(). A global
@@ -104,7 +114,13 @@ from multiprocessing.connection import Connection
 from typing import Any, Callable, Dict, List, Optional
 
 from common.models import SandboxConfig
-from sandbox.security import ImportGuard, apply_memory_limit, build_restricted_builtins, reset_memory_limit
+from sandbox.security import (
+    ImportGuard,
+    apply_memory_limit,
+    block_network,
+    build_restricted_builtins,
+    reset_memory_limit,
+)
 
 # How often the parent polls for a result while waiting on a call. Small
 # enough that a dead worker (crash/OOM) is noticed well before the full
@@ -240,6 +256,7 @@ def _worker_main(
     for tool_name in tool_names:
         namespace[tool_name] = _make_tool_proxy(tool_name)
 
+    block_network()
     import_guard = ImportGuard(config.authorized_imports)
     restricted_builtins = build_restricted_builtins(config.allowed_directories)
     restricted_builtins["__import__"] = import_guard.guarded_import
@@ -329,22 +346,36 @@ class Sandbox:
         self._tool_conn, self._worker_tool_conn = self._ctx.Pipe()
         self._worker = self._spawn_worker()
 
-    def _serve_tool_requests(self) -> None:
+    def _serve_tool_requests(self) -> float:
         """Answer any MCP tool calls the worker is waiting on, using the
-        real tool functions (and MCP connection) owned by this process."""
+        real tool functions (and MCP connection) owned by this process.
+
+        Returns how many seconds were actually spent running a real
+        tool -- the caller (execute()) adds this back onto its own
+        deadline, since MCP tool time must NOT count against the
+        sandbox's own execution budget (see the module docstring's
+        "Timeout independence" section). Without this, a
+        slow-but-legitimate tool call would be mistaken for the
+        sandboxed CODE running too long, and the worker would be
+        killed and reported as a "[TIMEOUT]" even though nothing was
+        actually stuck."""
+        spent = 0.0
         while self._tool_conn.poll():
             try:
                 tool_name, kwargs = self._tool_conn.recv()
             except (EOFError, OSError):
-                return  # worker died mid-request; execute() will notice
+                return spent  # worker died mid-request; execute() will notice
+            start = time.monotonic()
             try:
                 reply = ("ok", self.mcp_tools[tool_name](**kwargs))
             except Exception as e:
                 reply = ("error", f"Tool '{tool_name}' failed: {type(e).__name__}: {e}")
+            spent += time.monotonic() - start
             try:
                 self._tool_conn.send(reply)
             except (BrokenPipeError, OSError):
-                return
+                return spent
+        return spent
 
     def execute(self, code: str, echo_last_expr: bool = False) -> str:
         """Run `code` in the persistent worker and return what it printed
@@ -365,7 +396,10 @@ class Sandbox:
         over_memory_limit = False
         tick = 0
         while True:
-            self._serve_tool_requests() #checking mcp tool request
+            # Tool time doesn't count against the sandbox's own
+            # deadline -- push it forward by however long that tool
+            # call just took (see _serve_tool_requests()'s docstring).
+            deadline += self._serve_tool_requests()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break

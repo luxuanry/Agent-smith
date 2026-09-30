@@ -1,12 +1,21 @@
 """
 Sandbox security (Section V.2 points 3, 4).
 
-Four things the sandbox has to hold up under `tests/test_sandbox_security.py`:
+Five things the sandbox has to hold up under `tests/test_sandbox_security.py`:
   1. import allowlist    -- only whitelisted modules can be imported
   2. path allowlist       -- file access restricted to allowed_directories
-  3. timeout               -- enforced by killing the worker process (executor.py)
-  4. memory limit          -- resource.setrlimit, applied here, called once when
+  3. network block         -- socket.socket() patched to raise (block_network())
+  4. timeout               -- enforced by killing the worker process (executor.py)
+  5. memory limit          -- resource.setrlimit, applied here, called once when
                               the worker process starts (executor.py)
+
+Before this, network access was only blocked as a side effect of
+authorized_imports never including socket/urllib/requests/etc. -- true
+today, but not a dedicated guarantee: if a networking module is ever
+added to the allowlist for a legitimate reason, access would silently
+reopen with no separate safety net. block_network() patches the actual
+primitive underneath nearly all Python networking (socket.socket) so
+construction raises no matter how code got a reference to it.
 
 Only the standard library is used here (no third-party sandboxing libs).
 """
@@ -64,6 +73,32 @@ class ImportGuard:
 
     def uninstall(self) -> None:
         builtins.__import__ = self._real_import
+
+
+def block_network() -> None:
+    """Defense-in-depth network block (Section V.2: "No network access").
+
+    Must be called from trusted code -- executor.py's _worker_main(),
+    right alongside where ImportGuard is set up -- BEFORE the worker
+    installs the ImportGuard as the sandboxed namespace's __import__.
+    It needs the real, unguarded `import socket` to patch the module in
+    the first place; by the time sandboxed code runs, socket.socket is
+    already neutered regardless of whether `socket` itself is
+    importable.
+
+    Patches socket.socket (not just adds "socket" to a blocklist)
+    because it's the primitive nearly every higher-level networking
+    path -- sockets directly, socket.create_connection, urllib,
+    http.client, requests via urllib3 -- ultimately constructs. One
+    patch, one place, covers all of them instead of chasing each
+    library separately.
+    """
+    import socket
+
+    def _blocked(*args, **kwargs):
+        raise PermissionError("Network access is not allowed in the sandbox")
+
+    socket.socket = _blocked
 
 
 def build_restricted_builtins(allowed_directories: Iterable[str]) -> dict:

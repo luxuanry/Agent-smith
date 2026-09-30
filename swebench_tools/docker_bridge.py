@@ -38,8 +38,10 @@ import functools
 import json
 import os
 import posixpath
+import shlex
 import subprocess
 import sys
+import uuid
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -253,7 +255,20 @@ def docker_exec(
     # -i keeps stdin attached: without it docker closes the container
     # process's stdin, so anything passed as `input` never arrives.
     stdin_flag = ["-i"] if input is not None else []
-    full_cmd = ["docker", "exec", *stdin_flag, "-w", workdir, container, "bash", "-lc", command]
+
+    # subprocess.run(timeout=...) below only kills the local `docker exec`
+    # client process running on the HOST if we time out -- it has no way to
+    # reach the actual work happening inside the container, which is left
+    # running as an orphan. To make that recoverable, wrap `command` in a
+    # thin outer shell that records its own PID to `marker` and then
+    # `exec`s into `bash -lc command` -- exactly the original invocation,
+    # just handed off via exec (which replaces the process image in place,
+    # so the PID we recorded is still correct afterwards). On a timeout,
+    # _kill_orphan() reads that PID back and kills it for real. See its
+    # docstring for why.
+    marker = f"/tmp/.docker_exec_{uuid.uuid4().hex}.pid"
+    wrapped_command = f"echo $$ > {marker}; exec bash -lc {shlex.quote(command)}"
+    full_cmd = ["docker", "exec", *stdin_flag, "-w", workdir, container, "bash", "-c", wrapped_command]
     try:
         result = subprocess.run(
             full_cmd,
@@ -269,9 +284,53 @@ def docker_exec(
             timed_out=False,
         )
     except subprocess.TimeoutExpired as e:
+        _kill_orphan(container, marker)
         return ExecResult(
             returncode=-1,
             stdout=e.stdout or "",
             stderr=(e.stderr or "") + f"\n[docker_exec] timed out after {timeout}s",
             timed_out=True,
         )
+
+
+def _kill_orphan(container: str, marker: str) -> None:
+    """Best-effort cleanup after a docker_exec() timeout.
+
+    subprocess.run(timeout=...) only kills the local `docker exec` client
+    process on the host; it has no idea the actual work is happening
+    inside the container and never signals it. Left alone, that process
+    (and anything it spawned -- a test runner, a build, ...) keeps running
+    in the container, wasting CPU/memory and potentially still holding
+    files or locks the next tool call needs.
+
+    docker_exec() wrote that process's own PID to `marker` right before
+    handing off to the caller's real command via `exec` (see its
+    docstring). This reads the PID back and kills it three ways for good
+    measure, since we can't be sure the shell became its own process
+    group leader: as a negative PID (the whole process group, so children
+    like pytest's own subprocesses die too), as the bare PID (the process
+    itself), and via `pkill -P` (its direct children specifically) --
+    then removes the marker file.
+
+    Every step is wrapped so a missing container, a missing marker (the
+    process may have already finished right as the timeout fired), or
+    kill/pkill finding nothing to signal never raises: this is cleanup,
+    not something the caller should have to handle failures from.
+    """
+    try:
+        subprocess.run(
+            [
+                "docker", "exec", container, "bash", "-c",
+                f'pid=$(cat {marker} 2>/dev/null); '
+                f'if [ -n "$pid" ]; then '
+                f'kill -KILL -- -"$pid" 2>/dev/null; '
+                f'kill -KILL -- "$pid" 2>/dev/null; '
+                f'pkill -KILL -P "$pid" 2>/dev/null; '
+                f'fi; '
+                f'rm -f {marker}',
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        pass  # best-effort only -- a failed cleanup must never crash the caller
