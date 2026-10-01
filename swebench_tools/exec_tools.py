@@ -1,5 +1,4 @@
 """Execution tools: run_tests / get_patch / run_command (Section V.5.3)."""
-import base64
 import re
 
 from swebench_tools.docker_bridge import clean_stderr, docker_exec, get_task, to_abs, truncate
@@ -7,6 +6,10 @@ from swebench_tools.docker_bridge import clean_stderr, docker_exec, get_task, to
 # The eval script reinstalls the package and runs a whole test suite, so it
 # needs far more than docker_exec's default timeout.
 RUN_TESTS_TIMEOUT_SECONDS = 300
+
+# The script is passed on stdin, not on the command line: it contains quotes, heredocs 
+# and patch text that would break if pasted into a shell command, and a single command-line argument is limited to 128KB
+_RESET_TESTS_LINE = re.compile(r"^git checkout [0-9a-f]{7,40} .+$", re.MULTILINE)
 
 # Written inside the container, deliberately outside the repo: a file under
 # /testbed would show up in get_patch()'s diff and corrupt the answer.
@@ -101,13 +104,16 @@ def run_tests() -> str:
     if not eval_script.strip():
         return "[run_tests] the task file has no eval_script"
 
-    encoded = base64.b64encode(eval_script.encode()).decode()
     result = docker_exec(
-        f"echo {encoded} | base64 -d > {EVAL_SCRIPT_PATH} && bash {EVAL_SCRIPT_PATH}",
+        f"cat > {EVAL_SCRIPT_PATH} && bash {EVAL_SCRIPT_PATH}",
         timeout=RUN_TESTS_TIMEOUT_SECONDS,
+        input=eval_script,
     )
     if result.timed_out:
-        return f"[run_tests] timed out after {RUN_TESTS_TIMEOUT_SECONDS}s"
+                reset = _RESET_TESTS_LINE.search(eval_script)
+        if reset:
+            docker_exec(reset.group(0))
+        return f"[run_tests] timed out after {RUN_TESTS_TIMEOUT_SECONDS}s (test files restored)"
     return _summarize_test_output(result.stdout, result.stderr)
 
 
