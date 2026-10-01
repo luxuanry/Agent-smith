@@ -8,7 +8,9 @@ Usage:
 
 STAGE 1 (current): connects to mcp_tools_mbpp.py over stdio, discovers its
   tools (run_tests), generates the sandbox manual from them, and enforces
-  the hard limits (iterations/tokens/timeout).
+  the hard limits (iterations/tokens/timeout). A watchdog guarantees a
+  result file is written and the process stops before the time limit, even
+  if a tool or a request hangs.
 """
 from __future__ import annotations
 
@@ -22,15 +24,19 @@ from common.agent_loop import AgentLoop, build_system_prompt
 from common.env import load_env_file
 from common.llm_provider import LLMProvider
 from common.models import MBPPTaskInput, SandboxConfig, SolutionOutput
+from common.watchdog import ResultWriter, start_watchdog
 from sandbox.executor import Sandbox
 from sandbox.manual import generate_sandbox_manual
 from sandbox.mcp_client import MCPClient
 
-# Hard limits — Section VI.1.1
+# Hard limits (Section VI.1.1)
 MAX_ITERATIONS = 10
 MAX_INPUT_TOKENS = 6_000
 MAX_OUTPUT_TOKENS = 1_500
 TIMEOUT_SECONDS = 120
+
+SAFETY_MARGIN_SECONDS = 10   # stop starting new work this early
+WATCHDOG_MARGIN_SECONDS = 5  # hard stop this long before the limit
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -60,6 +66,31 @@ def main(argv=None) -> None:
     start = time.perf_counter()
     task_id = "unknown"
     mcp_client = MCPClient()
+    writer = ResultWriter(args.output)
+    state: dict = {"agent": None}
+
+    def failure_result(error: str) -> SolutionOutput:
+        return SolutionOutput(
+            task_id=task_id,
+            benchmark="mbpp",
+            success=False,
+            solution="",
+            iterations=0,
+            total_requests=0,
+            total_input_tokens=0,
+            total_output_tokens=0,
+            total_time_seconds=time.perf_counter() - start,
+            error=error,
+        )
+
+    def on_expire() -> None:
+        agent = state["agent"]
+        error = f"Hard time limit reached ({TIMEOUT_SECONDS}s), process stopped by watchdog"
+        writer.write(agent.build_result(False, "", error) if agent else failure_result(error))
+
+    # Last line of defense: if anything hangs (a tool, a request, cleanup),
+    # write whatever we have and stop the process before the limit.
+    start_watchdog(TIMEOUT_SECONDS - WATCHDOG_MARGIN_SECONDS, start, on_expire)
 
     try:
         with open(args.task_file, encoding="utf-8") as f:
@@ -92,32 +123,24 @@ def main(argv=None) -> None:
             max_input_tokens=MAX_INPUT_TOKENS,
             max_output_tokens=MAX_OUTPUT_TOKENS,
             timeout_seconds=TIMEOUT_SECONDS,
+            start_time=start,
+            safety_margin_seconds=SAFETY_MARGIN_SECONDS,
         )
+        state["agent"] = agent
         result = agent.run(task_id=task_id, benchmark="mbpp", user_task=build_user_task(task))
     except Exception as e:
-        result = SolutionOutput(
-            task_id=task_id,
-            benchmark="mbpp",
-            success=False,
-            solution="",
-            iterations=0,
-            total_requests=0,
-            total_input_tokens=0,
-            total_output_tokens=0,
-            total_time_seconds=time.perf_counter() - start,
-            error=f"{type(e).__name__}: {e}",
-        )
+        result = failure_result(f"{type(e).__name__}: {e}")
 
     # Write the result BEFORE attempting any cleanup, so a cleanup failure
     # (e.g. shutting down the MCP subprocess) can never cause us to lose a
-    # task result we already have.
-    with open(args.output, "w", encoding="utf-8") as f:
-        f.write(result.model_dump_json(indent=2))
+    # task result we already have. ResultWriter writes only once, so the
+    # watchdog cannot overwrite this later.
+    writer.write(result)
     print(f"success={result.success} iterations={result.iterations} error={result.error}")
 
     try:
         # Shuts down the MCP session, the mcp_tools_mbpp.py subprocess, and
-        # the background event-loop thread — without this the process can
+        # the background event-loop thread. Without this the process can
         # hang instead of exiting cleanly.
         mcp_client.close()
     except Exception as e:

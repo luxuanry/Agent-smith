@@ -18,6 +18,10 @@ file additionally has to:
      pattern as MBPP_TASK_FILE in agent_mbpp/__main__.py
   3. always clean the container up afterwards (stop + rm), success or not --
      exam_swebench.sh grades "container cleanup" as its own step
+
+Time limit: the clock starts here (so pulling the image counts). On timeout
+the agent tries to salvage the current patch, and a watchdog guarantees the
+result file is written and the container removed before the limit.
 """
 from __future__ import annotations
 
@@ -32,6 +36,7 @@ from common.docker_env import cleanup_container, container_name, pull_image, sta
 from common.env import load_env_file
 from common.llm_provider import LLMProvider
 from common.models import SandboxConfig, SolutionOutput, SWEBenchTaskInput
+from common.watchdog import ResultWriter, run_with_timeout, start_watchdog
 from sandbox.executor import Sandbox
 from sandbox.manual import generate_sandbox_manual
 from sandbox.mcp_client import MCPClient
@@ -41,6 +46,9 @@ MAX_ITERATIONS = 30
 MAX_INPUT_TOKENS = 300_000
 MAX_OUTPUT_TOKENS = 10_000
 TIMEOUT_SECONDS = 900
+
+SAFETY_MARGIN_SECONDS = 60    # stop starting new work this early
+WATCHDOG_MARGIN_SECONDS = 10  # hard stop this long before the limit
 
 # Env vars mcp_tools_swebench.py reads to know which task/container it is
 # serving -- must match the constants of the same name over there.
@@ -76,6 +84,35 @@ def main(argv=None) -> None:
     task_id = "unknown"
     mcp_client = MCPClient()
     container: str | None = None
+    writer = ResultWriter(args.output)
+    state: dict = {"agent": None}
+
+    def failure_result(error: str) -> SolutionOutput:
+        return SolutionOutput(
+            task_id=task_id,
+            benchmark="swebench",
+            success=False,
+            solution="",
+            iterations=0,
+            total_requests=0,
+            total_input_tokens=0,
+            total_output_tokens=0,
+            total_time_seconds=time.perf_counter() - start,
+            error=error,
+        )
+
+    def on_expire() -> None:
+        agent = state["agent"]
+        error = f"Hard time limit reached ({TIMEOUT_SECONDS}s), process stopped by watchdog"
+        writer.write(agent.build_result(False, "", error) if agent else failure_result(error))
+        # The process is about to be killed, so remove the container now
+        # (with its own time cap, so this cannot hang the watchdog).
+        if container is not None:
+            run_with_timeout(lambda: cleanup_container(container), 6)
+
+    # Last line of defense: if anything hangs (image pull, a tool, a request),
+    # write whatever we have, remove the container, and stop the process.
+    start_watchdog(TIMEOUT_SECONDS - WATCHDOG_MARGIN_SECONDS, start, on_expire)
 
     try:
         with open(args.task_file, encoding="utf-8") as f:
@@ -102,6 +139,12 @@ def main(argv=None) -> None:
         sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools)
         system_prompt = build_system_prompt(sandbox_manual=sandbox_manual, benchmark="swebench")
 
+        def salvage() -> str:
+            """On timeout, return the current diff so work already done is not lost."""
+            patch = wrapped_tools["get_patch"]()
+            text = str(patch) if patch is not None else ""
+            return "" if text.startswith("[error]") else text
+
         agent = AgentLoop(
             llm_provider=provider,
             sandbox=sandbox,
@@ -110,27 +153,20 @@ def main(argv=None) -> None:
             max_input_tokens=MAX_INPUT_TOKENS,
             max_output_tokens=MAX_OUTPUT_TOKENS,
             timeout_seconds=TIMEOUT_SECONDS,
+            start_time=start,
+            safety_margin_seconds=SAFETY_MARGIN_SECONDS,
+            salvage=salvage,
         )
+        state["agent"] = agent
         result = agent.run(task_id=task_id, benchmark="swebench", user_task=build_user_task(task))
     except Exception as e:
-        result = SolutionOutput(
-            task_id=task_id,
-            benchmark="swebench",
-            success=False,
-            solution="",
-            iterations=0,
-            total_requests=0,
-            total_input_tokens=0,
-            total_output_tokens=0,
-            total_time_seconds=time.perf_counter() - start,
-            error=f"{type(e).__name__}: {e}",
-        )
+        result = failure_result(f"{type(e).__name__}: {e}")
 
     # Write the result BEFORE attempting any cleanup, so a cleanup failure
     # (MCP subprocess or Docker) can never cause us to lose a task result we
-    # already have.
-    with open(args.output, "w", encoding="utf-8") as f:
-        f.write(result.model_dump_json(indent=2))
+    # already have. ResultWriter writes only once, so the watchdog cannot
+    # overwrite this later.
+    writer.write(result)
     print(f"success={result.success} iterations={result.iterations} error={result.error}")
 
     try:
