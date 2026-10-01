@@ -227,10 +227,6 @@ def test_allowed_modules_do_not_leak_blocked_ones(make_sandbox, code):
     assert "reached" not in sb.execute(code)
 
 
-@pytest.mark.xfail(
-    reason="in-process Python cannot fully hide object introspection (known limit)",
-    strict=False,
-)
 def test_subclasses_introspection_escape(sandbox):
     code = (
         "subs = ().__class__.__base__.__subclasses__()\n"
@@ -370,10 +366,6 @@ def test_normal_attribute_and_getattr_use_still_works(sandbox):
     assert "[3, 2, 1]" in output
 
 
-@pytest.mark.xfail(
-    reason="operator.attrgetter reads attributes by string, outside the AST check (known gap)",
-    strict=False,
-)
 def test_attrgetter_route_is_closed(make_sandbox):
     sb = make_sandbox(authorized_imports=["math", "random", "operator"])
     code = (
