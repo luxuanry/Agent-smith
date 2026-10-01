@@ -52,6 +52,7 @@ class ImportGuard:
     def __init__(self, authorized_imports: Iterable[str]):
         self.authorized: Set[str] = set(authorized_imports)
         self._real_import = builtins.__import__
+        self._safe_operator = None
 
     def _is_authorized(self, module_name: str) -> bool:
         if module_name in self.authorized:
@@ -66,7 +67,15 @@ class ImportGuard:
     def guarded_import(self, name, globals=None, locals=None, fromlist=(), level=0):
         if not self._is_authorized(name):
             raise ImportError(f"Module '{name}' is not in the authorized imports allowlist")
-        return self._real_import(name, globals, locals, fromlist, level)
+        module = self._real_import(name, globals, locals, fromlist, level)
+        # `operator` gets a checked copy (attrgetter/methodcaller refuse private names).
+        if name == "operator" and getattr(module, "__name__", "") == "operator":
+            from sandbox.code_guard import make_safe_operator
+
+            if self._safe_operator is None:
+                self._safe_operator = make_safe_operator(module)
+            return self._safe_operator
+        return module
 
     def install(self) -> None:
         builtins.__import__ = self.guarded_import

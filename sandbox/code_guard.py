@@ -105,3 +105,42 @@ def scrub_environment() -> None:
     the MCP connection and the API keys.
     """
     os.environ.clear()
+
+
+# ---------------------------------------------------------------------------
+# Checked copy of `operator`
+# ---------------------------------------------------------------------------
+# operator.attrgetter / methodcaller read attributes by *string*, which the AST
+# check cannot see. Sandboxed code gets a copy of the module whose versions of
+# these two refuse private names. The real `operator` module is not modified.
+
+
+def make_safe_operator(real_operator):
+    import types
+
+    safe = types.ModuleType("operator")
+    for name in dir(real_operator):
+        if not name.startswith("__"):
+            setattr(safe, name, getattr(real_operator, name))
+
+    def _check_dotted(name) -> None:
+        if isinstance(name, str):
+            for part in name.split("."):
+                if is_blocked_attr(part):
+                    raise _deny(part)
+
+    real_attrgetter = real_operator.attrgetter
+    real_methodcaller = real_operator.methodcaller
+
+    def attrgetter(*names):
+        for n in names:
+            _check_dotted(n)
+        return real_attrgetter(*names)
+
+    def methodcaller(name, *args, **kwargs):
+        _check_dotted(name)
+        return real_methodcaller(name, *args, **kwargs)
+
+    safe.attrgetter = attrgetter
+    safe.methodcaller = methodcaller
+    return safe
