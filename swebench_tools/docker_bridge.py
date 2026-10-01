@@ -267,7 +267,10 @@ def docker_exec(
     # _kill_orphan() reads that PID back and kills it for real. See its
     # docstring for why.
     marker = f"/tmp/.docker_exec_{uuid.uuid4().hex}.pid"
-    wrapped_command = f"echo $$ > {marker}; exec bash -lc {shlex.quote(command)}"
+    wrapped_command = (
+        f"echo $$ > {marker}; "
+        f"exec timeout -s KILL {timeout + 5} bash -lc {shlex.quote(command)}"
+    )
     full_cmd = ["docker", "exec", *stdin_flag, "-w", workdir, container, "bash", "-c", wrapped_command]
     try:
         result = subprocess.run(
