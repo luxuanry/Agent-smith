@@ -224,7 +224,10 @@ def _worker_main(
     import io
     import signal
 
+    from sandbox.code_guard import check_code, harden_builtins, scrub_environment
+
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    scrub_environment()
 
     # NOTE: the memory cap is intentionally NOT applied here. It's scoped
     # to just the exec() call below instead -- see the module docstring's
@@ -260,6 +263,7 @@ def _worker_main(
     import_guard = ImportGuard(config.authorized_imports)
     restricted_builtins = build_restricted_builtins(config.allowed_directories)
     restricted_builtins["__import__"] = import_guard.guarded_import
+    harden_builtins(restricted_builtins)
     namespace["__builtins__"] = restricted_builtins
 
     while True:
@@ -275,6 +279,7 @@ def _worker_main(
         error: Optional[str] = None
         apply_memory_limit(config.max_memory_mb)
         try:
+            check_code(code)
             compiled = _compile(code, echo_last_expr)
             with contextlib.redirect_stdout(stdout_buffer):
                 exec(compiled, namespace)
