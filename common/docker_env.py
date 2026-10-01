@@ -73,6 +73,7 @@ def start_container(image: str, name: str) -> None:
         [
             "docker", "run", "-dit",
             "--platform", DOCKER_PLATFORM,
+            "--network", "none",
             "--name", name,
             image, "/bin/bash",
         ],
