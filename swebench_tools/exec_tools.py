@@ -88,13 +88,16 @@ def _summarize_test_output(stdout: str, stderr: str) -> str:
 def run_tests() -> str:
     """Execute the evaluation script (eval_script from SWEBenchTaskInput).
 
-    The script is base64-encoded here and decoded inside the container
-    instead of being interpolated into the command line: it is a whole
-    multi-line bash script containing quotes, heredocs and patch text, none
-    of which survives being pasted into another shell command intact.
+    The script is passed on stdin, not on the command line: it contains
+    quotes, heredocs and patch text that would break if pasted into a shell
+    command, and a single command-line argument is limited to 128KB.
 
     It is written to /tmp, never into the repository, because any file
     under /testbed would appear in get_patch()'s diff.
+
+    If it times out, the eval script never reaches its final step that
+    restores the test files, so that step is run here -- otherwise the
+    gold test patch would leak into get_patch()'s diff.
 
     Returns a summary (pass/fail counts, failing test names, the tail of
     the log), not the full log, which is thousands of lines long.
@@ -110,7 +113,7 @@ def run_tests() -> str:
         input=eval_script,
     )
     if result.timed_out:
-                reset = _RESET_TESTS_LINE.search(eval_script)
+        reset = _RESET_TESTS_LINE.search(eval_script)
         if reset:
             docker_exec(reset.group(0))
         return f"[run_tests] timed out after {RUN_TESTS_TIMEOUT_SECONDS}s (test files restored)"
