@@ -126,8 +126,8 @@ class LLMProvider:
 
             # Rate limited or server error: switch key, wait, try again.
             if response.status_code == 429 or response.status_code >= 500:
-                wait = 2.0 * (retries + 1)
                 if response.status_code == 429:
+                    wait = 2.0 * (retries + 1)
                     self._limited_keys.add(self._key_index)
                     # Another key has its own quota: switch to it and wait only
                     # briefly. If every key is limited, wait as long as the
@@ -139,6 +139,10 @@ class LLMProvider:
                             self._limited_keys.clear()
                     else:
                         wait = 2.0
+                else:
+                    # 5xx (e.g. 503 "high demand") hits the whole model, not one
+                    # key: wait longer each time, capped at 30s.
+                    wait = min(30.0, 5.0 * (2 ** retries))
                 time_left = None if deadline is None else deadline - time.perf_counter()
                 if retries < max_retries and (time_left is None or time_left > wait + 1):
                     retries += 1
@@ -154,8 +158,13 @@ class LLMProvider:
 
         data = response.json()
         usage = data.get("usage") or {}
+        choices = data.get("choices") or []
+        message = (choices[0].get("message") or {}) if choices else {}
+        # Google omits "content" entirely when the output is empty (for example
+        # finish_reason "length"). That is a normal reply, not an error: return
+        # empty text and let the agent loop ask the model to try again.
         return LLMResponse(
-            text=data["choices"][0]["message"]["content"] or "",
+            text=message.get("content") or "",
             input_tokens=usage.get("prompt_tokens", 0),
             output_tokens=usage.get("completion_tokens", 0),
             request_time_ms=(time.perf_counter() - start) * 1000,
