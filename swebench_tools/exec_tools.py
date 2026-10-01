@@ -1,5 +1,4 @@
 """Execution tools: run_tests / get_patch / run_command (Section V.5.3)."""
-import base64
 import re
 
 from swebench_tools.docker_bridge import clean_stderr, docker_exec, get_task, to_abs, truncate
@@ -8,58 +7,71 @@ from swebench_tools.docker_bridge import clean_stderr, docker_exec, get_task, to
 # needs far more than docker_exec's default timeout.
 RUN_TESTS_TIMEOUT_SECONDS = 300
 
+# eval_script's "restore the test files" step: git checkout <base_commit> <test files...>
+_RESET_TESTS_LINE = re.compile(r"^git checkout [0-9a-f]{7,40} .+$", re.MULTILINE)
+
 # Written inside the container, deliberately outside the repo: a file under
 # /testbed would show up in get_patch()'s diff and corrupt the answer.
 EVAL_SCRIPT_PATH = "/tmp/agent_eval_script.sh"
 
 
-def _summarize_test_output(stdout: str, stderr: str) -> str:
+def _summarize_test_output(log: str) -> str:
     """Turn a full eval-script log into something an LLM can read.
 
-    The raw log runs to thousands of lines, most of it installation noise.
-    The SWE-bench eval script brackets the part that matters with
-    ">>>>> Start Test Output" / ">>>>> End Test Output", so that section is
-    what gets summarized: how many tests passed and failed, and the names
-    of the failing ones.
-
-    stdout and stderr are kept apart on purpose. The scripts run under
-    `set -x`, so the shell echoes the marker lines themselves to stderr;
-    looking for the markers in a merged log finds those echoes and returns
-    the trace instead of the test results, which are on stdout.
+    `log` is stdout and stderr merged in the order they were written (the
+    script runs with 2>&1). That matters: under `set -x` the shell traces
+    the ">>>>> Start/End Test Output" markers to stderr, and some runners
+    also write their results to stderr (unittest/Django) while others use
+    stdout (sympy's bin/test, pytest). Only one ordered stream puts the
+    markers and the results in the right place relative to each other.
     """
-    section = stdout
-    start = stdout.find("Start Test Output")
+    section = log
+    start = log.find("Start Test Output")
     if start != -1:
-        end = stdout.find("End Test Output", start)
-        section = stdout[start:end if end != -1 else len(stdout)]
+        end = log.find("End Test Output", start)
+        section = log[start:end if end != -1 else len(log)]
 
-    # Counting depends on the test runner: pytest prints "PASSED test_x",
-    # while sympy's own bin/test prints "45 passed, 1 failed" at the end.
-    passed = len(re.findall(r"\bPASSED\b", section))
-    failed = len(re.findall(r"\bFAILED\b", section))
-    errors = len(re.findall(r"\bERROR\b", section))
-
-    summary_lines = [
-        line.strip()
-        for line in section.splitlines()
-        if re.search(r"\b\d+\s+(passed|failed|error)", line)
-        or re.match(r"^=+.*\b(passed|failed|error)\b.*=+$", line.strip())
-        or "tests finished" in line
-    ]
-    for line in summary_lines:
-        for count, word in re.findall(r"\b(\d+)\s+(passed|failed|error)", line):
-            if word == "passed":
-                passed = max(passed, int(count))
-            elif word == "failed":
-                failed = max(failed, int(count))
-            else:
-                errors = max(errors, int(count))
-
-    # pytest: "FAILED path::test_name"; sympy underlines the name instead.
-    failing = re.findall(r"^(?:FAILED|ERROR)\s+(\S+)", section, flags=re.MULTILINE)
-    failing += re.findall(
-        r"^_{3,}\s+(\S*[A-Za-z0-9]\S*)\s+_{3,}$", section, flags=re.MULTILINE
-    )
+    summary_lines = []
+    # unittest / Django: "test_x (module.Class) ... ok" / "... FAIL" / "... ERROR"
+    unittest_results = re.findall(r" \.\.\. (ok|FAIL|ERROR)\s*$", section, flags=re.MULTILINE)
+    if unittest_results:
+        passed = unittest_results.count("ok")
+        failed = unittest_results.count("FAIL")
+        errors = unittest_results.count("ERROR")
+        summary_lines = [
+            line.strip()
+            for line in section.splitlines()
+            if re.match(r"^(Ran \d+ tests? in|FAILED \(|OK\b)", line.strip())
+        ]
+        failing = re.findall(r"^(?:FAIL|ERROR): (\S+ \([^)]*\))", section, flags=re.MULTILINE)
+    else:
+        summary_lines = [
+            line.strip()
+            for line in section.splitlines()
+            if re.search(r"\b\d+\s+(passed|failed|error)", line)
+            or re.match(r"^=+.*\b(passed|failed|error)\b.*=+$", line.strip())
+            or "tests finished" in line
+        ]
+        # Prefer the runner's own totals ("tests finished: 45 passed, 1 failed",
+        # "== 1 failed, 1 passed in 0.1s =="). Only without them, count result
+        # tokens -- pytest -rA prints each one twice (live line + short summary).
+        counts = {"passed": 0, "failed": 0, "error": 0}
+        found = False
+        for line in summary_lines:
+            for count, word in re.findall(r"\b(\d+)\s+(passed|failed|error)", line):
+                counts[word] = max(counts[word], int(count))
+                found = True
+        if found:
+            passed, failed, errors = counts["passed"], counts["failed"], counts["error"]
+        else:
+            passed = len(re.findall(r"\bPASSED\b", section))
+            failed = len(re.findall(r"\bFAILED\b", section))
+            errors = len(re.findall(r"\bERROR\b", section))
+        # pytest: "FAILED path::test_name"; sympy underlines the name instead.
+        failing = re.findall(r"^(?:FAILED|ERROR)\s+(\S+)", section, flags=re.MULTILINE)
+        failing += re.findall(
+            r"^_{3,}\s+(\S*[A-Za-z0-9]\S*)\s+_{3,}$", section, flags=re.MULTILINE
+        )
 
     lines = [f"[run_tests] {passed} passed, {failed} failed, {errors} errors"]
     lines.extend(dict.fromkeys(summary_lines))  # de-duplicated, order kept
@@ -70,13 +82,9 @@ def _summarize_test_output(stdout: str, stderr: str) -> str:
         if len(failing) > 20:
             lines.append(f"  ... and {len(failing) - 20} more")
 
-    # Keep the tail of the log, so a failure that happened before any test
-    # ran (an import error, a patch that would not apply) is still visible.
-    # In that case fall back to stderr, where the traceback usually is.
-    if passed or failed or errors:
-        tail_source = section
-    else:
-        tail_source = (stdout + "\n" + clean_stderr(stderr)).strip()
+    # Keep the tail, so a failure before any test ran (an import error, a
+    # patch that would not apply) is still visible.
+    tail_source = section if (passed or failed or errors) else log
     lines.append("--- end of test output ---")
     lines.append("\n".join(tail_source.strip().splitlines()[-25:]))
     return truncate("\n".join(lines))
@@ -85,13 +93,16 @@ def _summarize_test_output(stdout: str, stderr: str) -> str:
 def run_tests() -> str:
     """Execute the evaluation script (eval_script from SWEBenchTaskInput).
 
-    The script is base64-encoded here and decoded inside the container
-    instead of being interpolated into the command line: it is a whole
-    multi-line bash script containing quotes, heredocs and patch text, none
-    of which survives being pasted into another shell command intact.
+    The script is passed on stdin, not on the command line: it contains
+    quotes, heredocs and patch text that would break if pasted into a shell
+    command, and a single command-line argument is limited to 128KB.
 
     It is written to /tmp, never into the repository, because any file
     under /testbed would appear in get_patch()'s diff.
+
+    If it times out, the eval script never reaches its final step that
+    restores the test files, so that step is run here -- otherwise the
+    gold test patch would leak into get_patch()'s diff.
 
     Returns a summary (pass/fail counts, failing test names, the tail of
     the log), not the full log, which is thousands of lines long.
@@ -101,14 +112,17 @@ def run_tests() -> str:
     if not eval_script.strip():
         return "[run_tests] the task file has no eval_script"
 
-    encoded = base64.b64encode(eval_script.encode()).decode()
     result = docker_exec(
-        f"echo {encoded} | base64 -d > {EVAL_SCRIPT_PATH} && bash {EVAL_SCRIPT_PATH}",
+        f"cat > {EVAL_SCRIPT_PATH} && bash {EVAL_SCRIPT_PATH} 2>&1",
         timeout=RUN_TESTS_TIMEOUT_SECONDS,
+        input=eval_script,
     )
     if result.timed_out:
-        return f"[run_tests] timed out after {RUN_TESTS_TIMEOUT_SECONDS}s"
-    return _summarize_test_output(result.stdout, result.stderr)
+        reset = _RESET_TESTS_LINE.search(eval_script)
+        if reset:
+            docker_exec(reset.group(0))
+        return f"[run_tests] timed out after {RUN_TESTS_TIMEOUT_SECONDS}s (test files restored)"
+    return _summarize_test_output(result.stdout)
 
 
 def get_patch() -> str:
