@@ -61,6 +61,7 @@ class LLMProvider:
         stop_sequences: Optional[List[str]] = None,
         max_tokens: int = 1024,
         max_retries: int = 3,
+        deadline: Optional[float] = None,  # absolute time.perf_counter() value
     ) -> LLMResponse:
         payload = {
             "model": self.model_name,
@@ -81,18 +82,28 @@ class LLMProvider:
         retries = 0
         start = time.perf_counter()
         while True:
+            request_timeout = 120.0
+            if deadline is not None:
+                remaining = deadline - time.perf_counter()
+                if remaining <= 1:
+                    raise TimeoutError("No time left for an LLM request")
+                request_timeout = min(120.0, remaining)
+
             response = requests.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self._current_key()}"},
                 json=payload,
-                timeout=120,
+                timeout=request_timeout,
             )
-            # Rate limited or server error: switch key, wait a bit, try again.
+            # Rate limited or server error: switch key, wait a bit, try again,
+            # but only if the wait still fits in the time budget.
             if response.status_code == 429 or response.status_code >= 500:
-                if retries < max_retries:
+                wait = 2 * (retries + 1)
+                time_left = None if deadline is None else deadline - time.perf_counter()
+                if retries < max_retries and (time_left is None or time_left > wait + 1):
                     retries += 1
                     self._rotate_key()
-                    time.sleep(2 * retries)
+                    time.sleep(wait)
                     continue
             if not response.ok:
                 # Include the body: providers explain the real cause there (e.g. unknown model).

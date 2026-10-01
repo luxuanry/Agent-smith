@@ -11,18 +11,24 @@ Agent loop core (Section V.1): Thought -> Code -> Observation.
 
 STAGE 1 (current): max_iterations, max_input_tokens, max_output_tokens and
   timeout_seconds are all enforced. Token limits are cumulative across all
-  iterations of the task (Section VI.1); timeout is checked before starting
-  each new LLM call, not mid-request.
+  iterations of the task (Section VI.1).
+
+  Time limit: the clock starts at `start_time` (the entry point's start, so
+  setup such as pulling an image counts). New work stops `safety_margin_seconds`
+  before the limit, and every LLM request gets that same deadline, so one slow
+  request cannot run past it. On timeout, `salvage` (if given) may return a
+  partial solution, e.g. the current patch.
 
 """
 from __future__ import annotations
 
 import time
-from typing import List
+from typing import Callable, List, Optional
 
 from common.code_extraction import extract_python_code_block
 from common.llm_provider import LLMProvider
 from common.models import SolutionOutput, StepMetrics
+from common.watchdog import run_with_timeout
 
 STOP_SEQUENCES = ["<end_code>"]
 
@@ -41,6 +47,9 @@ class AgentLoop:
         max_input_tokens: int,
         max_output_tokens: int,
         timeout_seconds: int,
+        start_time: Optional[float] = None,
+        safety_margin_seconds: float = 0.0,
+        salvage: Optional[Callable[[], str]] = None,
     ):
         self.llm_provider = llm_provider
         self.sandbox = sandbox
@@ -49,43 +58,75 @@ class AgentLoop:
         self.max_input_tokens = max_input_tokens
         self.max_output_tokens = max_output_tokens
         self.timeout_seconds = timeout_seconds
+        self.start_time = start_time
+        self.safety_margin_seconds = safety_margin_seconds
+        self.salvage = salvage
+
+        # State kept on the object so another thread (the watchdog) can
+        # build a result from whatever has happened so far.
+        self.steps: List[StepMetrics] = []
+        self._task_id = "unknown"
+        self._benchmark = ""
+        self._start = time.perf_counter()
+
+    def build_result(self, success: bool, solution: str, error=None) -> SolutionOutput:
+        steps = list(self.steps)
+        return SolutionOutput(
+            task_id=self._task_id,
+            benchmark=self._benchmark,
+            success=success,
+            solution=solution,
+            iterations=len(steps),
+            total_requests=sum(1 + s.retries for s in steps),
+            total_input_tokens=sum(s.input_tokens for s in steps),
+            total_output_tokens=sum(s.output_tokens for s in steps),
+            total_time_seconds=time.perf_counter() - self._start,
+            steps=steps,
+            system_prompt=self.system_prompt,
+            error=error,
+        )
+
+    def _timeout_result(self) -> SolutionOutput:
+        solution = ""
+        if self.salvage is not None:
+            # Use what is left before the hard limit (at most 20s), keeping
+            # 3s to write the result file.
+            hard_end = self._start + self.timeout_seconds - 3
+            budget = min(20.0, hard_end - time.perf_counter())
+            if budget > 1:
+                solution = run_with_timeout(self.salvage, budget) or ""
+        return self.build_result(
+            False, solution, f"Reached timeout ({self.timeout_seconds}s) before completing"
+        )
 
     def run(self, task_id: str, benchmark: str, user_task: str) -> SolutionOutput:
-        start = time.perf_counter()
+        self._task_id, self._benchmark = task_id, benchmark
+        self._start = self.start_time if self.start_time is not None else time.perf_counter()
+        soft_deadline = self._start + self.timeout_seconds - self.safety_margin_seconds
+
         messages = [
             {"role": "system", "content": self.system_prompt},
             {"role": "user", "content": user_task},
         ]
-        steps: List[StepMetrics] = []
-
-        def finish(success: bool, solution: str, error=None) -> SolutionOutput:
-            return SolutionOutput(
-                task_id=task_id,
-                benchmark=benchmark,
-                success=success,
-                solution=solution,
-                iterations=len(steps),
-                total_requests=sum(1 + s.retries for s in steps),
-                total_input_tokens=sum(s.input_tokens for s in steps),
-                total_output_tokens=sum(s.output_tokens for s in steps),
-                total_time_seconds=time.perf_counter() - start,
-                steps=steps,
-                system_prompt=self.system_prompt,
-                error=error,
-            )
+        self.steps.clear()
+        steps = self.steps
 
         total_input_tokens = 0
         total_output_tokens = 0
 
         for step in range(1, self.max_iterations + 1):
-            elapsed = time.perf_counter() - start
-            if elapsed >= self.timeout_seconds:
-                return finish(False, "", f"Reached timeout ({self.timeout_seconds}s) before completing")
+            if time.perf_counter() >= soft_deadline:
+                return self._timeout_result()
 
             try:
-                response = self.llm_provider.generate(messages, stop_sequences=STOP_SEQUENCES)
+                response = self.llm_provider.generate(
+                    messages, stop_sequences=STOP_SEQUENCES, deadline=soft_deadline
+                )
             except Exception as e:
-                return finish(False, "", f"LLM request failed at step {step}: {e}")
+                out_of_time = isinstance(e, TimeoutError) or time.perf_counter() >= soft_deadline - 1
+                if out_of_time:
+                    return self._timeout_result()
+                return self.build_result(False, "", f"LLM request failed at step {step}: {e}")
 
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
@@ -97,7 +138,7 @@ class AgentLoop:
                     "```python ... ``` block, then <end_code>."
                 )
             else:
-                observation = self.sandbox.execute(extraction.code) or "(no output — use print())"
+                observation = self.sandbox.execute(extraction.code) or "(no output, use print())"
 
             steps.append(
                 StepMetrics(
@@ -116,22 +157,24 @@ class AgentLoop:
 
             if self.sandbox.final_answer_called:
                 # A successful final_answer on this very step counts as success even
-                # if this step's tokens happen to push the running total over budget --
+                # if this step's tokens happen to push the running total over budget:
                 # the totals were only knowable after the response that solved the task.
-                return finish(True, self.sandbox.final_answer_value)
+                return self.build_result(True, self.sandbox.final_answer_value)
 
             if total_input_tokens > self.max_input_tokens:
-                return finish(False, "", f"Exceeded max input tokens ({self.max_input_tokens})")
+                return self.build_result(False, "", f"Exceeded max input tokens ({self.max_input_tokens})")
             if total_output_tokens > self.max_output_tokens:
-                return finish(False, "", f"Exceeded max output tokens ({self.max_output_tokens})")
+                return self.build_result(False, "", f"Exceeded max output tokens ({self.max_output_tokens})")
 
-                       # Some providers (e.g. Cohere) reject empty messages. A reasoning model
+            # Some providers (e.g. Cohere) reject empty messages. A reasoning model
             # can spend its whole output budget thinking and return no text at all,
             # so never send an empty assistant message back.
             messages.append({"role": "assistant", "content": response.text or "(empty response)"})
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
 
-        return finish(False, "", f"Reached max iterations ({self.max_iterations}) without final_answer")
+        return self.build_result(
+            False, "", f"Reached max iterations ({self.max_iterations}) without final_answer"
+        )
 
 
 def build_system_prompt(sandbox_manual: str, benchmark: str) -> str:
