@@ -37,7 +37,7 @@ from common.env import load_env_file
 from common.llm_provider import LLMProvider
 from common.models import SandboxConfig, SolutionOutput, SWEBenchTaskInput
 from common.watchdog import ResultWriter, run_with_timeout, start_watchdog
-from sandbox.executor import Sandbox
+from sandbox.executor import Sandbox, emergency_cleanup
 from sandbox.manual import generate_sandbox_manual
 from sandbox.mcp_client import MCPClient
 
@@ -105,6 +105,8 @@ def main(argv=None) -> None:
         agent = state["agent"]
         error = f"Hard time limit reached ({TIMEOUT_SECONDS}s), process stopped by watchdog"
         writer.write(agent.build_result(False, "", error) if agent else failure_result(error))
+        # os._exit follows: stop sandbox workers and remove temp files first.
+        emergency_cleanup()
         # The process is about to be killed, so remove the container now
         # (with its own time cap, so this cannot hang the watchdog).
         if container is not None:

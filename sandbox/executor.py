@@ -105,10 +105,15 @@ Import restriction:
 """
 from __future__ import annotations
 
+import atexit
+import io
 import multiprocessing as mp
+import os
+import tempfile
 import queue as queue_module
 import time
 import traceback
+import weakref
 import codeop
 from multiprocessing.connection import Connection
 from typing import Any, Callable, Dict, List, Optional
@@ -131,6 +136,95 @@ _POLL_INTERVAL_SECONDS = 0.1
 # out to `ps` -- cheap, but no need to do it on every single 0.1s poll tick.
 # Checking every 2nd tick still catches a runaway allocation within ~0.2s.
 _RSS_CHECK_EVERY_N_TICKS = 2
+
+# Output printed before a timeout / memory kill / crash. The worker writes its
+# stdout through to a file (up to a cap), so the parent can still read what was
+# printed after the worker has been killed.
+_OUTPUT_FILE_CAP_BYTES = 1_000_000
+_PARTIAL_OUTPUT_MAX_CHARS = 2000
+
+# Cap on the output of a normal (finished) call. Long output keeps its start
+# and its end, so the LLM still sees how it began and how it ended.
+_RESULT_OUTPUT_HEAD_CHARS = 8000
+_RESULT_OUTPUT_TAIL_CHARS = 4000
+_RESULT_OUTPUT_MAX_CHARS = _RESULT_OUTPUT_HEAD_CHARS + _RESULT_OUTPUT_TAIL_CHARS
+
+# Every live Sandbox, so emergency_cleanup() can reach their workers and files.
+_LIVE_SANDBOXES = weakref.WeakSet()
+
+
+def _cap_output(text: str) -> str:
+    if len(text) <= _RESULT_OUTPUT_MAX_CHARS:
+        return text
+    omitted = len(text) - _RESULT_OUTPUT_HEAD_CHARS - _RESULT_OUTPUT_TAIL_CHARS
+    return (
+        text[:_RESULT_OUTPUT_HEAD_CHARS]
+        + f"\n[... {omitted} characters omitted ...]\n"
+        + text[-_RESULT_OUTPUT_TAIL_CHARS:]
+    )
+
+
+class _TeeStream(io.TextIOBase):
+    """stdout replacement inside the worker. Everything goes to the in-memory
+    buffer (the normal result) and, up to a cap, is also flushed to a file."""
+
+    def __init__(self, buffer, out_file, cap_bytes):
+        self._buffer = buffer
+        self._file = out_file
+        self._cap = cap_bytes
+        self._written = 0
+
+    def writable(self):
+        return True
+
+    def write(self, s):
+        self._buffer.write(s)
+        if self._file is not None and self._written < self._cap:
+            try:
+                self._file.write(s)
+                self._file.flush()
+                self._written += len(s)
+            except (OSError, ValueError):
+                self._file = None
+        return len(s)
+
+    def flush(self):
+        pass
+
+
+def _remove_file(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def emergency_cleanup() -> None:
+    """Last-resort cleanup for paths that end with os._exit (the watchdog).
+
+    os._exit skips atexit handlers and multiprocessing's own exit hook, so
+    sandbox workers would be left running and their temp files left behind.
+    Never raises.
+    """
+    for sb in list(_LIVE_SANDBOXES):
+        try:
+            if sb._worker.is_alive():
+                sb._worker.kill()
+        except Exception:
+            pass
+        try:
+            _remove_file(sb._output_path)
+        except Exception:
+            pass
+
+
+def _open_output_file(path):
+    if not path:
+        return None
+    try:
+        return open(path, "w", encoding="utf-8")
+    except OSError:
+        return None
 
 
 def _get_worker_rss_mb(pid: int) -> Optional[float]:
@@ -215,6 +309,7 @@ def _worker_main(
     config: SandboxConfig,
     tool_names: List[str],
     tool_conn: "Connection",
+    output_path: Optional[str] = None,
 ) -> None:
     """Entry point of the child process. Runs until it receives `None`
     (shutdown sentinel) or is killed by the parent. Everything in here
@@ -276,12 +371,14 @@ def _worker_main(
         code, echo_last_expr = request
 
         stdout_buffer = io.StringIO()
+        out_file = _open_output_file(output_path)
+        tee = _TeeStream(stdout_buffer, out_file, _OUTPUT_FILE_CAP_BYTES)
         error: Optional[str] = None
         apply_memory_limit(config.max_memory_mb)
         try:
             check_code(code)
             compiled = _compile(code, echo_last_expr)
-            with contextlib.redirect_stdout(stdout_buffer):
+            with contextlib.redirect_stdout(tee):
                 exec(compiled, namespace)
         except (KeyboardInterrupt, SystemExit):
             raise
@@ -296,6 +393,8 @@ def _worker_main(
             # time it's called -- that shouldn't be squeezed by a limit
             # meant only for the code that just ran.
             reset_memory_limit()
+            if out_file is not None:
+                out_file.close()
 
         result_queue.put(
             {
@@ -321,9 +420,15 @@ class Sandbox:
         self._ctx = mp.get_context("fork")
         self._code_queue: "mp.Queue" = self._ctx.Queue()
         self._result_queue: "mp.Queue" = self._ctx.Queue()
+        # File the worker writes its stdout through to; read back if the worker
+        # has to be killed (timeout, memory limit, crash).
+        fd, self._output_path = tempfile.mkstemp(prefix="sandbox_out_", suffix=".txt")
+        os.close(fd)
+        atexit.register(_remove_file, self._output_path)
         # Pipe for MCP tool calls: the worker sends requests, we answer them.
         self._tool_conn, self._worker_tool_conn = self._ctx.Pipe()
         self._worker: mp.process.BaseProcess = self._spawn_worker()
+        _LIVE_SANDBOXES.add(self)
 
     def _spawn_worker(self) -> mp.process.BaseProcess:
         worker = self._ctx.Process(
@@ -334,6 +439,7 @@ class Sandbox:
                 self.config,
                 list(self.mcp_tools),
                 self._worker_tool_conn,
+                self._output_path,
             ),
             daemon=True,
         )
@@ -350,6 +456,30 @@ class Sandbox:
         self._result_queue = self._ctx.Queue()
         self._tool_conn, self._worker_tool_conn = self._ctx.Pipe()
         self._worker = self._spawn_worker()
+
+    def _read_partial_output(self) -> str:
+        """What the worker printed before it was killed. Call it after the
+        worker is dead, so the file is final. Long output keeps its start and end."""
+        try:
+            with open(self._output_path, "r", encoding="utf-8", errors="replace") as f:
+                text = f.read()
+        except OSError:
+            return ""
+        limit = _PARTIAL_OUTPUT_MAX_CHARS
+        if len(text) > limit:
+            half = limit // 2
+            omitted = len(text) - limit
+            text = text[:half] + f"\n[... {omitted} characters omitted ...]\n" + text[-half:]
+        return text
+
+    def _with_partial(self, message: str) -> str:
+        """Put the output printed before the stop in front of the stop message."""
+        partial = self._read_partial_output()
+        if not partial:
+            return message
+        if not partial.endswith("\n"):
+            partial += "\n"
+        return f"{partial}{message}\n(The output above was printed before the execution was stopped.)"
 
     def _serve_tool_requests(self) -> float:
         """Answer any MCP tool calls the worker is waiting on, using the
@@ -394,6 +524,12 @@ class Sandbox:
         Note it rides along with each call rather than being worker state --
         that's what keeps _restart_worker() free of anything to re-init.
         """
+        # Start from an empty file, so a kill below cannot return output
+        # left over from an earlier call.
+        try:
+            open(self._output_path, "w").close()
+        except OSError:
+            pass
         self._code_queue.put((code, echo_last_expr))
 
         deadline = time.monotonic() + self.config.max_execution_time_seconds
@@ -423,23 +559,30 @@ class Sandbox:
 
         if over_memory_limit:
             self._restart_worker()
-            return f"[MEMORY LIMIT] Execution exceeded {self.config.max_memory_mb}MB and was stopped"
+            return self._with_partial(
+                f"[MEMORY LIMIT] Execution exceeded {self.config.max_memory_mb}MB and was stopped"
+            )
 
         if result is None:
             if self._worker.is_alive():
                 self._restart_worker()
-                return f"[TIMEOUT] Execution exceeded {self.config.max_execution_time_seconds}s and was terminated"
+                return self._with_partial(
+                    f"[TIMEOUT] Execution exceeded {self.config.max_execution_time_seconds}s and was terminated"
+                )
             else:
                 self._restart_worker()
-                return "[CRASHED] Worker process died while running this code (likely OOM or a segfault)"
+                return self._with_partial(
+                    "[CRASHED] Worker process died while running this code (likely OOM or a segfault)"
+                )
 
         if result["final_answer_called"]:
             self.final_answer_value = result["final_answer_value"]
             self.final_answer_called = True
 
+        output = _cap_output(result["output"])
         if result["error"]:
-            return result["output"] + result["error"]
-        return result["output"]
+            return output + result["error"]
+        return output
 
     def run_repl(self) -> None:
         """Read code, execute it, print result. `exit` or EOF quits."""
@@ -496,6 +639,10 @@ class Sandbox:
             if self._worker.is_alive():
                 self._worker.kill()
                 self._worker.join()
+        try:
+            os.remove(self._output_path)
+        except (OSError, AttributeError):
+            pass
 
     def __del__(self) -> None:
         try:
