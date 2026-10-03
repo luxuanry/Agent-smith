@@ -114,6 +114,9 @@ class AgentLoop:
 
         total_input_tokens = 0
         total_output_tokens = 0
+        # code -> (step, observation) of its last run, to catch an LLM that
+        # repeats the same call hoping for a different answer.
+        previous_runs = {}
 
         for step in range(1, self.max_iterations + 1):
             if time.perf_counter() >= soft_deadline:
@@ -144,6 +147,15 @@ class AgentLoop:
                 if extraction.warning:
                     # Tell the LLM what was interpreted, so it is never left guessing.
                     observation = f"[Note] {extraction.warning}\n{observation}"
+                previous = previous_runs.get(extraction.code)
+                previous_runs[extraction.code] = (step, observation)
+                if previous is not None and previous[1] == observation:
+                    # Weak models can loop on one call until the budget runs out.
+                    observation = (
+                        f"[Note] You already ran exactly this code at step {previous[0]} "
+                        "and got the same result. Running it again will not change it: "
+                        "try a different approach.\n" + observation
+                    )
 
             steps.append(
                 StepMetrics(

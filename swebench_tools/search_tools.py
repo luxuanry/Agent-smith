@@ -1,8 +1,9 @@
 """Code search tools: search_code / search_function_or_class_definition_in_code /
 find_references (Section V.5.2)."""
+import re
 import shlex
 
-from swebench_tools.docker_bridge import clean_stderr, docker_exec, to_abs, truncate
+from swebench_tools.docker_bridge import REPO_DIR, clean_stderr, docker_exec, to_abs, truncate
 
 # A broad pattern can match thousands of lines; showing the first hundred
 # and saying so is more useful to the LLM than a wall of text.
@@ -87,13 +88,31 @@ def search_code(pattern: str, file_pattern: str) -> str:
     """Grep-like search. Output format:
     /absolute/path/to/file.py:<line_number> <line_content>
 
-    `pattern` is a plain grep pattern, `file_pattern` a shell glob such as
-    "*.py".
+    `pattern` is an extended grep regex (so "a|b" works), `file_pattern` a
+    shell glob such as "*.py".
     """
-    # -I skips binary files, -n adds line numbers, --include applies the glob.
-    result = docker_exec(
-        f"grep -rnI --include={shlex.quote(file_pattern)} -e {shlex.quote(pattern)} ."
-    )
+    # -E because LLMs write "a|b" and expect alternation, which basic grep
+    # reads as the literal text "a|b". A pattern that is not a valid regex
+    # (e.g. "def handle(") is searched as plain text (-F) instead of failing.
+    try:
+        re.compile(pattern)
+        mode = "-E"
+    except re.error:
+        mode = "-F"
+    if "/" in file_pattern:
+        # --include only matches the base name, so "tests/x/test_y.py" would
+        # silently match nothing; the LLM then concludes the code is absent
+        # and keeps searching. Match the whole path with find instead.
+        # -H keeps the file name even when only one file matches.
+        result = docker_exec(
+            f"find {REPO_DIR} -path {shlex.quote(to_abs(file_pattern))} -type f "
+            f"-exec grep -nIH {mode} -e {shlex.quote(pattern)} {{}} +"
+        )
+    else:
+        # -I skips binary files, -n adds line numbers, --include applies the glob.
+        result = docker_exec(
+            f"grep -rnI {mode} --include={shlex.quote(file_pattern)} -e {shlex.quote(pattern)} ."
+        )
     if result.timed_out:
         return "[search_code] timed out; try a narrower pattern"
     # grep exits 1 when there is simply no match, which is not an error here.

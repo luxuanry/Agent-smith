@@ -19,10 +19,12 @@ Supported formats:
 2. XML tool calls (Anthropic-style): <invoke name="..."><parameter>...</parameter></invoke>
 3. JSON/Hermes tool calls: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
 4. ReAct format: Action: tool_name / Action Input: {...}
+5. Function-tag tool calls: <function=name><parameter=key>value</parameter></function>
 
 Non-Python formats are converted into equivalent Python function call
-strings, e.g. an XML/JSON/ReAct call to read_file becomes:
-    read_file(filepath="/testbed/file.py")
+strings, printed so the result reaches the LLM, e.g. a non-Python call to
+read_file becomes:
+    print(read_file(filepath="/testbed/file.py"))
 
 If a single response mixes several formats, the extracted snippets are
 concatenated in the order they appear in the original text.
@@ -66,6 +68,15 @@ _XML_PARAM_RE = re.compile(r'<parameter name="([^"]+)">(.*?)</parameter>', re.DO
 
 _JSON_TOOLCALL_RE = re.compile(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', re.DOTALL)
 
+# Function-tag calls, which some models fall back to (usually inside <tool_call>):
+#   <function=read_file>
+#   <parameter=filepath>
+#   /testbed/x.py
+#   </parameter>
+#   </function>
+_FUNCTION_TAG_RE = re.compile(r"<function=([^>\s]+)>(.*?)</function>", re.DOTALL)
+_FUNCTION_TAG_PARAM_RE = re.compile(r"<parameter=([^>\s]+)>(.*?)</parameter>", re.DOTALL)
+
 # The lookahead accepts either a newline followed by another
 # Action/Observation block, OR the end of the string directly
 # (no trailing newline required in the latter case).
@@ -101,9 +112,14 @@ def _call_to_python(name: str, arguments: dict) -> str:
     """Convert a (function name, arguments dict) pair into a single
     line of equivalent Python function-call code. Uses repr() instead
     of manual string building to avoid quoting/escaping bugs.
+
+    The call is wrapped in print(): only printed output reaches the LLM,
+    and a tool call is made to see its result. final_answer returns None,
+    so printing it would only add noise.
     """
     args_str = ", ".join(f"{k}={v!r}" for k, v in arguments.items())
-    return f"{name}({args_str})"
+    call = f"{name}({args_str})"
+    return call if name == "final_answer" else f"print({call})"
 
 
 def _extract_xml_calls(text: str) -> List[Tuple[int, str]]:
@@ -141,6 +157,33 @@ def _extract_json_calls(text: str, notes: List[str]) -> List[Tuple[int, str]]:
     return results
 
 
+def _extract_function_tag_calls(text: str, notes: List[str]) -> List[Tuple[int, str]]:
+    """Extract <function=name><parameter=key>value</parameter></function> calls."""
+    results = []
+    for m in _FUNCTION_TAG_RE.finditer(text):
+        name = m.group(1)
+        # Values sit on their own lines; drop only that one leading/trailing
+        # newline, never the indentation an edit_file old_str depends on.
+        args = {
+            p.group(1): _coerce(re.sub(r"\A\n|\n\Z", "", p.group(2)))
+            for p in _FUNCTION_TAG_PARAM_RE.finditer(m.group(2))
+        }
+        # Some replies wrap every call in a generic function whose parameters
+        # are the real tool's name and its arguments: unwrap it.
+        if "tool_name" in args:
+            name = str(args["tool_name"]).strip()
+            inner = args.get("arguments", {})
+            if not isinstance(inner, dict):
+                notes.append(
+                    f"The arguments of '{name}' were not a JSON object, so I called "
+                    f"{name}() with no arguments."
+                )
+                inner = {}
+            args = inner
+        results.append((m.start(), _call_to_python(name, args)))
+    return results
+
+
 def _extract_react_calls(text: str, notes: List[str]) -> List[Tuple[int, str]]:
     """Extract ReAct-format calls: Action: xxx / Action Input: {...}"""
     results = []
@@ -165,7 +208,7 @@ def _extract_react_calls(text: str, notes: List[str]) -> List[Tuple[int, str]]:
 def extract_python_code_block(llm_text: str) -> ExtractionResult:
     """Extract executable Python code from a raw LLM response.
 
-    Detects all four formats, sorts the matches by their position in
+    Detects all five formats, sorts the matches by their position in
     the original text, and concatenates them into one code string.
     The agent loop only needs to call this one function.
     """
@@ -196,6 +239,7 @@ def extract_python_code_block(llm_text: str) -> ExtractionResult:
     for label, found in (
         ("XML", _extract_xml_calls(llm_text)),
         ("JSON", _extract_json_calls(llm_text, notes)),
+        ("function-tag", _extract_function_tag_calls(llm_text, notes)),
         ("ReAct", _extract_react_calls(llm_text, notes)),
     ):
         if found:
