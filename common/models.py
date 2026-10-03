@@ -1,9 +1,10 @@
 """
-共享数据模型（Pydantic）。
+Shared data models (Pydantic).
 
-这些模型的字段是项目文档（Chapter V）里明确规定的，
-不需要你们自己设计——但你们必须理解每个字段的用途，
-因为评审时会问「这个字段是干什么的」。
+The fields of these models are specified explicitly in the project subject
+(Chapter V), so you do not need to design them yourselves. But you must
+understand what each field is for, because the review will ask
+"what is this field for?".
 """
 from __future__ import annotations
 
@@ -14,13 +15,13 @@ from pydantic import BaseModel, Field
 
 
 # --------------------------------------------------------------------------
-# 沙盒配置（Section V.2）
+# Sandbox configuration (Section V.2)
 # --------------------------------------------------------------------------
 class SandboxConfig(BaseModel):
     """Sandbox configuration for student solutions.
 
-    使用白名单（allowlist）策略：只有 authorized_imports 里列出的模块
-    才能被 import，其余一律拒绝。
+    Uses an allowlist strategy: only modules listed in authorized_imports
+    can be imported, everything else is rejected.
     """
 
     authorized_imports: List[str] = Field(
@@ -44,7 +45,7 @@ class SandboxConfig(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# MBPP 任务输入（Section V.3）
+# MBPP task input (Section V.3)
 # --------------------------------------------------------------------------
 class MBPPTaskInput(BaseModel):
     """Input for MBPP task evaluation."""
@@ -57,7 +58,7 @@ class MBPPTaskInput(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# SWE-bench 任务输入（Section V.4）
+# SWE-bench task input (Section V.4)
 # --------------------------------------------------------------------------
 class SWEBenchTaskInput(BaseModel):
     """Input for a SWE-bench task, provided by the moulinette.
@@ -82,7 +83,7 @@ class SWEBenchTaskInput(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Agent 每一步的执行记录（Section V.3 / V.4）
+# Record of each agent step (Section V.3 / V.4)
 # --------------------------------------------------------------------------
 class StepMetrics(BaseModel):
     """Metrics for a single agent step.
@@ -104,10 +105,11 @@ class StepMetrics(BaseModel):
 
 
 # --------------------------------------------------------------------------
-# Agent 最终输出（这是 evaluation 用来打分的结构，格式不能改）
+# Final agent output (the structure the evaluation uses for scoring,
+# the format must not change)
 # --------------------------------------------------------------------------
 class SolutionOutput(BaseModel):
-    """Output from student solution — required format for evaluation.
+    """Output from student solution, required format for evaluation.
 
     This is the JSON structure your agent must produce and write to solution.json.
     """

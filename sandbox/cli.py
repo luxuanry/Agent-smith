@@ -1,17 +1,13 @@
 """
-沙盒 CLI 入口（Section V.2 第1点）。
+Sandbox CLI 
 
-对应 pyproject.toml 里的:
-    [project.scripts]
-    sandbox = "sandbox.cli:main"
 
-用法（PDF 里给的example）：
-    uv run sandbox                                             # 交互式REPL
-    uv run sandbox sandbox_template.json                       # 自定义配置
+examples:
+    uv run sandbox                                             # REPL
+    uv run sandbox sandbox_template.json                       # REPL with config
     uv run sandbox --mcp-stdio "python mcp_tools_mbpp.py" sandbox_template.json
     uv run sandbox --mcp-server <URL>
 
-=== 你们需要实现的部分（TODO） ===
 """
 from __future__ import annotations
 
