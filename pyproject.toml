@@ -7,7 +7,6 @@ dependencies = [
     "pydantic>=2.0",
     "requests>=2.31",
     "mcp>=1.0,<2.0",          # Model Context Protocol SDK — pip install mcp
-    # TODO: add your MCP transport deps if needed (e.g. "mcp[cli]")
 ]
 
 [project.optional-dependencies]
