@@ -1,4 +1,4 @@
-*This project has been created as part of the 42 curriculum by lcao, <login2>, <login3>.*
+*This project has been created as part of the 42 curriculum by lcao, rxue, suna.*
 
 # Agent Smith
 
@@ -415,8 +415,6 @@ See [BENCHMARK_REPORT.md](./BENCHMARK_REPORT.md) for the full comparison.
 
 ### How AI was used
 
-<!-- TODO (team): check and complete this list so it matches what each of us actually did. -->
-
 AI assistants were used as helpers; all code was reviewed, tested and
 understood by the team before being kept.
 
@@ -430,4 +428,3 @@ understood by the team before being kept.
   `common/llm_provider.py`, tested with real API calls.
 - **Documentation:** first draft of this README, written from the code and
   then reviewed by the team.
-- <!-- TODO: sandbox, agent loop, code extraction, MBPP agent: add how AI was or was not used. -->
