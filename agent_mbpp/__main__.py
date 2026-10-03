@@ -105,11 +105,22 @@ def main(argv=None) -> None:
         # Connect to the MBPP MCP server and discover what tools it exposes.
         mcp_client.connect_stdio("python mcp_tools_mbpp.py")
         mcp_client.discover_tools()
-        wrapped_tools = mcp_client.wrap_as_python_functions()
+        # Resources and prompts are optional (Section V.2 point 5): a
+        # tools-only server like ours yields none, an unknown server may not.
+        mcp_client.discover_resources()
+        mcp_client.discover_prompts()
+        # Tool wrappers + the resource/prompt access functions, in one dict:
+        # the Sandbox creates a proxy for every name in it.
+        wrapped_tools = {
+            **mcp_client.wrap_as_python_functions(),
+            **mcp_client.wrap_resources_and_prompts(),
+        }
 
         # Turn the discovered tool schemas into readable text so the system
         # prompt actually tells the LLM these tools exist and how to call them.
-        sandbox_manual = generate_sandbox_manual(mcp_client.tools)
+        sandbox_manual = generate_sandbox_manual(
+            mcp_client.tools, mcp_client.resources, mcp_client.prompts
+        )
 
         provider = LLMProvider(args.model_name, args.provider_url, args.api_key_env)
         sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools)
