@@ -374,3 +374,54 @@ def test_attrgetter_route_is_closed(make_sandbox):
         "print('reached')"
     )
     assert "reached" not in sb.execute(code)
+
+
+# ---- output printed before a stop is not lost ------------------------------
+
+
+def test_output_before_timeout_is_kept(sandbox):
+    output = sandbox.execute("print('before')\nwhile True:\n    pass")
+    assert "before" in output
+    assert "timeout" in output.lower()
+
+
+def test_output_before_memory_stop_is_kept(sandbox):
+    output = sandbox.execute(
+        "print('before')\nx = bytearray(400 * 1024 * 1024)\nprint('after')"
+    )
+    assert "before" in output
+    assert "after" not in output
+    assert "memory" in output.lower()
+
+
+def test_no_stale_output_from_a_previous_call(sandbox):
+    sandbox.execute("print('first call')")
+    output = sandbox.execute("while True:\n    pass")
+    assert "first call" not in output
+    assert "timeout" in output.lower()
+
+
+# ---- output size cap, and cleanup for the watchdog path --------------------
+
+
+def test_very_long_output_is_capped(sandbox):
+    output = sandbox.execute("print('x' * 50000)")
+    assert len(output) < 13000
+    assert "characters omitted" in output
+    assert output.startswith("xxxx")
+
+
+def test_normal_output_is_not_changed(sandbox):
+    assert sandbox.execute("print('hello')") == "hello\n"
+
+
+def test_emergency_cleanup_stops_worker_and_removes_file(make_sandbox):
+    from sandbox.executor import emergency_cleanup
+
+    sb = make_sandbox()
+    path = sb._output_path
+    assert os.path.exists(path)
+    emergency_cleanup()
+    sb._worker.join(timeout=3)
+    assert not sb._worker.is_alive()
+    assert not os.path.exists(path)

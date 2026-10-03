@@ -86,7 +86,7 @@ class AgentLoop:
             error=error,
         )
 
-    def _timeout_result(self) -> SolutionOutput:
+    def _timeout_result(self, detail: str = "") -> SolutionOutput:
         solution = ""
         if self.salvage is not None:
             # Use what is left before the hard limit (at most 20s), keeping
@@ -95,9 +95,10 @@ class AgentLoop:
             budget = min(20.0, hard_end - time.perf_counter())
             if budget > 1:
                 solution = run_with_timeout(self.salvage, budget) or ""
-        return self.build_result(
-            False, solution, f"Reached timeout ({self.timeout_seconds}s) before completing"
-        )
+        message = f"Reached timeout ({self.timeout_seconds}s) before completing"
+        if detail:
+            message += f": {detail}"
+        return self.build_result(False, solution, message)
 
     def run(self, task_id: str, benchmark: str, user_task: str) -> SolutionOutput:
         self._task_id, self._benchmark = task_id, benchmark
@@ -125,7 +126,7 @@ class AgentLoop:
             except Exception as e:
                 out_of_time = isinstance(e, TimeoutError) or time.perf_counter() >= soft_deadline - 1
                 if out_of_time:
-                    return self._timeout_result()
+                    return self._timeout_result(str(e))
                 return self.build_result(False, "", f"LLM request failed at step {step}: {e}")
 
             total_input_tokens += response.input_tokens
@@ -133,12 +134,16 @@ class AgentLoop:
 
             extraction = extract_python_code_block(response.text)
             if extraction.code is None:
-                observation = (
+                # The warning already says what to do (and why nothing was run).
+                observation = extraction.warning or (
                     "No code block found. Reply with 'Thought: ...' followed by a "
                     "```python ... ``` block, then <end_code>."
                 )
             else:
                 observation = self.sandbox.execute(extraction.code) or "(no output, use print())"
+                if extraction.warning:
+                    # Tell the LLM what was interpreted, so it is never left guessing.
+                    observation = f"[Note] {extraction.warning}\n{observation}"
 
             steps.append(
                 StepMetrics(

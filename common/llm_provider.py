@@ -105,13 +105,17 @@ class LLMProvider:
             payload["stop"] = stop_sequences
 
         retries = 0
+        last_error = ""
         start = time.perf_counter()
         while True:
             request_timeout = 120.0
             if deadline is not None:
                 remaining = deadline - time.perf_counter()
                 if remaining <= 1:
-                    raise TimeoutError("No time left for an LLM request")
+                    raise TimeoutError(
+                        "No time left for an LLM request"
+                        + (f" (last error: {last_error})" if last_error else "")
+                    )
                 request_timeout = min(120.0, remaining)
 
             response = requests.post(
@@ -123,6 +127,8 @@ class LLMProvider:
 
             if response.status_code != 429 and response.status_code < 500:
                 self._limited_keys.discard(self._key_index)
+            else:
+                last_error = f"HTTP {response.status_code}: {response.text[:200]}"
 
             # Rate limited or server error: switch key, wait, try again.
             if response.status_code == 429 or response.status_code >= 500:
