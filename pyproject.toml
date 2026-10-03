@@ -2,7 +2,7 @@
 name = "agent-smith"
 version = "0.1.0"
 description = "Agentic framework solving MBPP & SWE-bench tasks (42 School project)"
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.10,<4.0"
 dependencies = [
     "pydantic>=2.0",
     "requests>=2.31",
@@ -16,8 +16,8 @@ dev = [
     "ruff>=0.5",
 ]
 
-# uv 会用这个把 `uv run sandbox` 变成一条可执行命令，
-# 指向 sandbox/cli.py 里的 main() 函数
+# uv uses this to turn `uv run sandbox` into an executable command
+# that calls the main() function in sandbox/cli.py
 [project.scripts]
 sandbox = "sandbox.cli:main"
 
