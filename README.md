@@ -50,20 +50,29 @@ use with it:
 
 ```json
 {
-  "default": {"provider": "gemini", "model": "gemini-3.6-flash"},
+  "default": {"provider": "openrouter", "model": "qwen/qwen3.8-27b:free"},
   "providers": {
     "gemini": {
       "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
       "api_key_env": "GOOGLE_API_KEY",
       "models": ["gemini-3.6-flash"]
     },
-    "openrouter": { "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY", "models": ["..."] }
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "models": ["qwen/qwen3.8-27b:free", "nvidia/nemotron-3-ultra-550b-a55b:free", "..."]
+    }
   }
 }
 ```
 
-The `models` lists are for reference: a model that is not listed is still used
-as given.
+The default is `qwen/qwen3.8-27b:free` on OpenRouter, the best model in our
+benchmark (see [BENCHMARK_REPORT.md](BENCHMARK_REPORT.md)). The `models` lists
+are for reference: a model that is not listed is still used as given.
+
+To add a provider with an OpenAI-compatible API, add an entry under
+`providers` and put its key(s) in `.env` under the `api_key_env` name; no code
+change is needed.
 
 | Option | Meaning | Default |
 |---|---|---|
@@ -73,10 +82,12 @@ as given.
 | `--api-key-env` | Name of the variable in `.env` that holds the key | see below |
 | `--model-config` | Path of the models config file | `models.json` |
 
-Three ways to choose the model:
+Ways to choose the model:
 ```bash
---provider gemini --model-name gemini-3.6-flash            # look the provider up in models.json
-                                                           # nothing at all: models.json "default"
+                                                           # nothing at all: models.json "default" (qwen on OpenRouter)
+--model-name nvidia/nemotron-3-ultra-550b-a55b:free        # another model on the default provider
+--provider gemini                                          # another provider, its first listed model
+--provider gemini --model-name gemini-3.6-flash            # another provider, a specific model
 --model-name "<model>" --provider-url "<url>"              # explicit, works without models.json
 ```
 With `--provider-url`, the key variable is `--api-key-env` if given; otherwise
@@ -113,9 +124,9 @@ cd moulinette
 uv run moulinette_eval dump mbpp --output ../cache/mbpp_task.json
 cd ..
 uv run python -m agent_mbpp --task-file cache/mbpp_task.json \
-    --output cache/mbpp_solution.json \
-    --model-name "<model>" --provider-url "<url>" [--api-key-env <VAR>]
-# or: --provider gemini --model-name gemini-3.6-flash   (see "Choosing an LLM provider")
+    --output cache/mbpp_solution.json
+# default model from models.json; add e.g. --provider gemini, or
+# --model-name "<model>" --provider-url "<url>" (see "Choosing an LLM provider")
 ```
 
 ### Running the SWE-bench agent
@@ -124,9 +135,8 @@ cd moulinette
 uv run moulinette_eval dump swebench --task-id sympy__sympy-14711 --output ../cache/swebench_task.json
 cd ..
 uv run python -m agent_swebench --task-file cache/swebench_task.json \
-    --output cache/swebench_solution.json \
-    --model-name "<model>" --provider-url "<url>" [--api-key-env <VAR>]
-# or: --provider gemini --model-name gemini-3.6-flash
+    --output cache/swebench_solution.json
+# same model options as the MBPP agent
 cd moulinette
 uv run moulinette_eval validate swebench ../cache/swebench_task.json ../cache/swebench_solution.json
 ```

@@ -1,5 +1,5 @@
 {
-  "default": {"provider": "gemini", "model": "gemini-3.6-flash"},
+  "default": {"provider": "openrouter", "model": "qwen/qwen3.8-27b:free"},
   "providers": {
     "gemini": {
       "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
