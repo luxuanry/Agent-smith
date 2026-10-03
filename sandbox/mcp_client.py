@@ -6,6 +6,21 @@ The sandbox itself acts as an MCP client, connecting to an MCP server
 evaluation, an unknown MCP server — so this logic must stay generic and
 never hardcode "I know there are exactly these tools").
 
+What gets exposed (Section V.2 point 5: "MCP tools, resources, and prompts
+must be exposed")
+--------------------------------------------------------------------------
+An MCP server can offer three kinds of things:
+  - tools:     functions the LLM can call (read_file, run_tests, ...)
+  - resources: read-only data, each identified by a URI (config://..., file://...)
+  - prompts:   reusable prompt templates that take string arguments
+All three are discovered here. Tools become one Python function each (see
+wrap_as_python_functions). Resources and prompts are exposed through four
+generic functions (see wrap_resources_and_prompts): list_resources(),
+read_resource(uri=...), list_prompts() and get_prompt(name=..., arguments=...).
+Many servers (ours included) offer only tools, so resources and prompts
+are optional: a server that does not support them simply yields none,
+and nothing extra appears in the sandbox.
+
 Sync vs async — why the background thread exists
 --------------------------------------------------
 The official MCP Python SDK is async (built on asyncio): every call to the
@@ -52,6 +67,11 @@ from mcp.client.streamable_http import streamable_http_client
 class MCPClient:
     def __init__(self):
         self.tools: Dict[str, object] = {}  # tool_name -> Tool schema object (from the server)
+        self.resources: Dict[str, object] = {}  # uri -> Resource object (from the server)
+        self.prompts: Dict[str, object] = {}  # prompt_name -> Prompt object (from the server)
+        # What the server said it supports during initialize(). Used to skip
+        # asking for resources/prompts when the server does not offer them.
+        self._capabilities = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._session: Optional[ClientSession] = None
@@ -121,7 +141,12 @@ class MCPClient:
             async with open_transport() as streams:
                 read, write = streams[0], streams[1]
                 async with ClientSession(read, write) as session:
-                    await session.initialize()
+                    init_result = await session.initialize()
+                    # The server's answer to initialize() lists what it
+                    # supports (tools / resources / prompts ...). Keep it so
+                    # discover_resources()/discover_prompts() know whether
+                    # asking makes sense at all.
+                    self._capabilities = getattr(init_result, "capabilities", None)
                     self._session = session
                     self._ready.set()  # connect_*() can now return
                     await self._stop_event.wait()  # keep the session open until close() is called
@@ -179,6 +204,133 @@ class MCPClient:
 
         wrapper.__name__ = tool_name
         return wrapper
+
+    # ------------------------------------------------------------------
+    # Discovering resources and prompts
+    # ------------------------------------------------------------------
+    def discover_resources(self) -> Dict[str, object]:
+        """List the server's resources (read-only data identified by a URI).
+
+        Returns {} when the server does not offer resources. A server that
+        advertises them but fails to list them is treated the same way, so
+        an odd server can never stop the agent from starting.
+        """
+        if not getattr(self._capabilities, "resources", None):
+            self.resources = {}
+            return self.resources
+
+        async def _list():
+            result = await self._session.list_resources()
+            return result.resources
+
+        try:
+            resources = self._run_coro(_list())
+        except Exception:
+            resources = []
+        self.resources = {str(r.uri): r for r in resources}
+        return self.resources
+
+    def discover_prompts(self) -> Dict[str, object]:
+        """List the server's prompt templates.
+
+        Returns {} when the server does not offer prompts (or fails to list
+        them), for the same reason as discover_resources().
+        """
+        if not getattr(self._capabilities, "prompts", None):
+            self.prompts = {}
+            return self.prompts
+
+        async def _list():
+            result = await self._session.list_prompts()
+            return result.prompts
+
+        try:
+            prompts = self._run_coro(_list())
+        except Exception:
+            prompts = []
+        self.prompts = {p.name: p for p in prompts}
+        return self.prompts
+
+    def wrap_resources_and_prompts(self) -> Dict[str, Callable]:
+        """Plain Python functions that give the sandbox access to the
+        server's resources and prompts, merged with the tool wrappers by
+        the caller before the Sandbox is created.
+
+        Only added when the server actually offers resources / prompts, so
+        a tools-only server (like ours) adds nothing to the sandbox. Like
+        the tool wrappers, they are called through the sandbox's proxies,
+        so they take KEYWORD arguments only, and always return a string
+        (errors included) instead of raising.
+        """
+        functions: Dict[str, Callable] = {}
+        if self.resources:
+            functions["list_resources"] = self._list_resources
+            functions["read_resource"] = self._read_resource
+        if self.prompts:
+            functions["list_prompts"] = self._list_prompts
+            functions["get_prompt"] = self._get_prompt
+        # A real tool with the same name always wins: never hide it.
+        return {name: fn for name, fn in functions.items() if name not in self.tools}
+
+    def _list_resources(self) -> str:
+        """One line per resource: its URI, then its description (or name)."""
+        lines = []
+        for uri, resource in self.resources.items():
+            description = getattr(resource, "description", None) or getattr(resource, "name", "") or ""
+            lines.append(f"{uri}  {description}".rstrip())
+        return "\n".join(lines) or "(no resources)"
+
+    def _read_resource(self, uri: str) -> str:
+        """Return the content of the resource at `uri` as text."""
+
+        async def _read():
+            return await self._session.read_resource(uri)
+
+        try:
+            result = self._run_coro(_read())
+        except Exception as e:
+            return f"[error] read_resource({uri!r}) failed: {type(e).__name__}: {e}"
+
+        parts = []
+        for content in result.contents:
+            if getattr(content, "text", None) is not None:
+                parts.append(content.text)
+            else:
+                # Binary content (an image, a PDF, ...) cannot be shown as text.
+                mime_type = getattr(content, "mimeType", None) or "unknown type"
+                parts.append(f"[binary content, {mime_type}]")
+        return "\n".join(parts)
+
+    def _list_prompts(self) -> str:
+        """One line per prompt: name(arguments) then its description.
+        Optional arguments are marked with a trailing '?'."""
+        lines = []
+        for name, prompt in self.prompts.items():
+            arguments = getattr(prompt, "arguments", None) or []
+            signature = ", ".join(a.name + ("" if a.required else "?") for a in arguments)
+            description = getattr(prompt, "description", None) or ""
+            lines.append(f"{name}({signature})  {description}".rstrip())
+        return "\n".join(lines) or "(no prompts)"
+
+    def _get_prompt(self, name: str, arguments: Optional[dict] = None) -> str:
+        """Fill the prompt template `name` with `arguments` and return its
+        messages, one per line, prefixed with their role."""
+        # The MCP spec defines prompt arguments as strings.
+        string_arguments = {key: str(value) for key, value in (arguments or {}).items()}
+
+        async def _get():
+            return await self._session.get_prompt(name, arguments=string_arguments)
+
+        try:
+            result = self._run_coro(_get())
+        except Exception as e:
+            return f"[error] get_prompt({name!r}) failed: {type(e).__name__}: {e}"
+
+        lines = []
+        for message in result.messages:
+            text = getattr(message.content, "text", None)
+            lines.append(f"[{message.role}] {text if text is not None else '(non-text content)'}")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
     # Cleanup

@@ -131,9 +131,20 @@ def main(argv=None) -> None:
 
         mcp_client.connect_stdio("python mcp_tools_swebench.py")
         mcp_client.discover_tools()
-        wrapped_tools = mcp_client.wrap_as_python_functions()
+        # Resources and prompts are optional (Section V.2 point 5): a
+        # tools-only server like ours yields none, an unknown server may not.
+        mcp_client.discover_resources()
+        mcp_client.discover_prompts()
+        # Tool wrappers + the resource/prompt access functions, in one dict:
+        # the Sandbox creates a proxy for every name in it.
+        wrapped_tools = {
+            **mcp_client.wrap_as_python_functions(),
+            **mcp_client.wrap_resources_and_prompts(),
+        }
 
-        sandbox_manual = generate_sandbox_manual(mcp_client.tools)
+        sandbox_manual = generate_sandbox_manual(
+            mcp_client.tools, mcp_client.resources, mcp_client.prompts
+        )
 
         provider = LLMProvider(args.model_name, args.provider_url, args.api_key_env)
         sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools)
