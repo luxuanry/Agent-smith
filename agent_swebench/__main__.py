@@ -5,6 +5,9 @@ Usage:
     uv run python -m agent_swebench --task-file ../cache/swebench_task.json \
         --output ../cache/swebench_solution.json \
         --model-name "model/name" --provider-url "https://provider.api/v1"
+    # or pick the provider from models.json (or omit both for its default):
+    uv run python -m agent_swebench --task-file ... --output ... \
+        --provider gemini --model-name gemini-3.6-flash
 
 Mirrors agent_mbpp/__main__.py: same AgentLoop / build_system_prompt /
 SolutionOutput plumbing (see that file for the parts that are identical).
@@ -35,6 +38,7 @@ from common.agent_loop import AgentLoop, build_system_prompt
 from common.docker_env import cleanup_container, container_name, pull_image, start_container
 from common.env import load_env_file
 from common.llm_provider import LLMProvider
+from common.model_config import DEFAULT_MODELS_CONFIG, resolve_model
 from common.models import SandboxConfig, SolutionOutput, SWEBenchTaskInput
 from common.watchdog import ResultWriter, run_with_timeout, start_watchdog
 from sandbox.executor import Sandbox
@@ -60,9 +64,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="agent_swebench")
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--model-name", required=True)
-    parser.add_argument("--provider-url", required=True)
-    parser.add_argument("--api-key-env", default="OPENROUTER_API_KEY")
+    # Provider/model: either explicit (--model-name + --provider-url) or
+    # looked up in models.json (--provider, or its "default"). See
+    # common/model_config.py for the exact rules.
+    parser.add_argument("--model-name", default=None)
+    parser.add_argument("--provider-url", default=None)
+    parser.add_argument("--provider", default=None, help="provider name from models.json")
+    parser.add_argument("--api-key-env", default=None)
+    parser.add_argument("--model-config", default=DEFAULT_MODELS_CONFIG)
     return parser.parse_args(argv)
 
 
@@ -135,7 +144,10 @@ def main(argv=None) -> None:
 
         sandbox_manual = generate_sandbox_manual(mcp_client.tools)
 
-        provider = LLMProvider(args.model_name, args.provider_url, args.api_key_env)
+        model_name, provider_url, api_key_env = resolve_model(
+            args.model_config, args.provider, args.model_name, args.provider_url, args.api_key_env
+        )
+        provider = LLMProvider(model_name, provider_url, api_key_env)
         sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools)
         system_prompt = build_system_prompt(sandbox_manual=sandbox_manual, benchmark="swebench")
 

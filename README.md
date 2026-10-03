@@ -38,30 +38,57 @@ uv sync
 ```
 
 Several keys for the same provider can be stored in one variable, separated by
-commas (`GEMINI_API_KEY=key1,key2`). When a request is rate limited (429)
+commas (`OPENROUTER_API_KEY=key1,key2`). When a request is rate limited (429)
 or the server fails (5xx), the provider switches to the next key and retries.
 
 ### Choosing an LLM provider
 
-The agents take three provider options:
+Providers and models are configured in [`models.json`](models.json) at the
+repository root. For each provider it lists the base URL, the **name** of the
+`.env` variable holding its key(s) (never the key itself), and the models we
+use with it:
+
+```json
+{
+  "default": {"provider": "gemini", "model": "gemini-3.6-flash"},
+  "providers": {
+    "gemini": {
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "api_key_env": "GOOGLE_API_KEY",
+      "models": ["gemini-3.6-flash"]
+    },
+    "openrouter": { "base_url": "https://openrouter.ai/api/v1", "api_key_env": "OPENROUTER_API_KEY", "models": ["..."] }
+  }
+}
+```
+
+The `models` lists are for reference: a model that is not listed is still used
+as given.
 
 | Option | Meaning | Default |
 |---|---|---|
-| `--model-name` | Model identifier at that provider | (required) |
-| `--provider-url` | Base URL of the API | (required) |
-| `--api-key-env` | Name of the variable in `.env` that holds the key | `GEMINI_API_KEY` |
+| `--model-name` | Model identifier at that provider | the provider's first model, or `default` |
+| `--provider` | Provider name from `models.json` | `default.provider` |
+| `--provider-url` | Base URL of the API; overrides `--provider` | (from `models.json`) |
+| `--api-key-env` | Name of the variable in `.env` that holds the key | see below |
+| `--model-config` | Path of the models config file | `models.json` |
 
-Two kinds of APIs are supported by `common/llm_provider.py`:
+Three ways to choose the model:
+```bash
+--provider gemini --model-name gemini-3.6-flash            # look the provider up in models.json
+                                                           # nothing at all: models.json "default"
+--model-name "<model>" --provider-url "<url>"              # explicit, works without models.json
+```
+With `--provider-url`, the key variable is `--api-key-env` if given; otherwise
+the `api_key_env` of the provider in `models.json` with the same base URL;
+otherwise `OPENROUTER_API_KEY`. The resolution rules live in
+`common/model_config.py`.
 
-- **OpenAI-compatible APIs** (OpenRouter, Groq, ...), called on
-  `<provider-url>/chat/completions`.
-- **Google Gemini native API**, used automatically when the URL contains
-  `googleapis.com`. Example:
-  ```bash
-  --model-name gemini-3.8-flash \
-  --provider-url https://generativelanguage.googleapis.com/v1beta/ \
-  --api-key-env GEMINI_API_KEY
-  ```
+Every provider is called through its OpenAI-compatible
+`<base_url>/chat/completions` endpoint by `common/llm_provider.py`, including
+Gemini (`.../v1beta/openai`). The only provider-specific code there is the
+parameter that turns reasoning down (`reasoning` for OpenRouter,
+`reasoning_effort` for URLs containing `googleapis.com`).
 
 ### Running the sandbox interactively
 ```bash
@@ -88,6 +115,7 @@ cd ..
 uv run python -m agent_mbpp --task-file cache/mbpp_task.json \
     --output cache/mbpp_solution.json \
     --model-name "<model>" --provider-url "<url>" [--api-key-env <VAR>]
+# or: --provider gemini --model-name gemini-3.6-flash   (see "Choosing an LLM provider")
 ```
 
 ### Running the SWE-bench agent
@@ -98,6 +126,7 @@ cd ..
 uv run python -m agent_swebench --task-file cache/swebench_task.json \
     --output cache/swebench_solution.json \
     --model-name "<model>" --provider-url "<url>" [--api-key-env <VAR>]
+# or: --provider gemini --model-name gemini-3.6-flash
 cd moulinette
 uv run moulinette_eval validate swebench ../cache/swebench_task.json ../cache/swebench_solution.json
 ```
@@ -110,7 +139,7 @@ always stops and removes the container, whether the run succeeded or not.
 
 ### Running the tests
 ```bash
-uv run pytest tests/
+uv run --extra dev pytest tests/
 ```
 
 ### Exploring a SWE-bench container by hand
