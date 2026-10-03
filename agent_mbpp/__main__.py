@@ -5,6 +5,9 @@ Usage:
     uv run python -m agent_mbpp --task-file ../cache/mbpp_task.json \
         --output ../cache/mbpp_solution.json \
         --model-name "model/name" --provider-url "https://provider.api/v1"
+    # or pick the provider from models.json (or omit both for its default):
+    uv run python -m agent_mbpp --task-file ... --output ... \
+        --provider gemini --model-name gemini-3.6-flash
 
 STAGE 1 (current): connects to mcp_tools_mbpp.py over stdio, discovers its
   tools (run_tests), generates the sandbox manual from them, and enforces
@@ -23,6 +26,7 @@ import time
 from common.agent_loop import AgentLoop, build_system_prompt
 from common.env import load_env_file
 from common.llm_provider import LLMProvider
+from common.model_config import DEFAULT_MODELS_CONFIG, resolve_model
 from common.models import MBPPTaskInput, SandboxConfig, SolutionOutput
 from common.watchdog import ResultWriter, start_watchdog
 from sandbox.executor import Sandbox, emergency_cleanup
@@ -43,9 +47,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="agent_mbpp")
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--model-name", required=True)
-    parser.add_argument("--provider-url", required=True)
-    parser.add_argument("--api-key-env", default="OPENROUTER_API_KEY")
+    # Provider/model: either explicit (--model-name + --provider-url) or
+    # looked up in models.json (--provider, or its "default"). See
+    # common/model_config.py for the exact rules.
+    parser.add_argument("--model-name", default=None)
+    parser.add_argument("--provider-url", default=None)
+    parser.add_argument("--provider", default=None, help="provider name from models.json")
+    parser.add_argument("--api-key-env", default=None)
+    parser.add_argument("--model-config", default=DEFAULT_MODELS_CONFIG)
     return parser.parse_args(argv)
 
 
@@ -124,7 +133,10 @@ def main(argv=None) -> None:
             mcp_client.tools, mcp_client.resources, mcp_client.prompts
         )
 
-        provider = LLMProvider(args.model_name, args.provider_url, args.api_key_env)
+        model_name, provider_url, api_key_env = resolve_model(
+            args.model_config, args.provider, args.model_name, args.provider_url, args.api_key_env
+        )
+        provider = LLMProvider(model_name, provider_url, api_key_env)
         sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools)
         system_prompt = build_system_prompt(sandbox_manual=sandbox_manual, benchmark="mbpp")
 
