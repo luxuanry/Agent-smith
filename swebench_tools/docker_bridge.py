@@ -30,6 +30,11 @@ Settings (which container, which task) are resolved in this priority order:
      via common.docker_env.container_name() -- lets you test the tools in
      this package standalone against a container you started by hand,
      without running the full agent_swebench pipeline first.
+
+Local testbed mode: if none of the above is set but TESTBED_PATH is, commands
+run on this machine in that directory instead of in a container (see
+_local_exec()). This is how exams/exam_sandbox.sh tests the tools, with a
+small local repo and no Docker. There is no isolation in this mode.
 """
 from __future__ import annotations
 
@@ -50,6 +55,7 @@ from common.docker_env import pull_image, start_container
 
 TASK_FILE_ENV = "SWEBENCH_TASK_FILE"
 CONTAINER_NAME_ENV = "SWEBENCH_CONTAINER_NAME"
+TESTBED_PATH_ENV = "TESTBED_PATH"
 
 REPO_DIR = "/testbed"  # SWE-bench images always check the repo out here
 DEFAULT_TIMEOUT_SECONDS = 120
@@ -251,6 +257,10 @@ def docker_exec(
     purpose: run_command's entire job is to let the LLM execute arbitrary
     shell.
     """
+    local_root = _local_testbed()
+    if local_root:
+        return _local_exec(local_root, command, workdir, timeout, input)
+
     container = get_container()
     # -i keeps stdin attached: without it docker closes the container
     # process's stdin, so anything passed as `input` never arrives.
@@ -294,6 +304,60 @@ def docker_exec(
             stderr=(e.stderr or "") + f"\n[docker_exec] timed out after {timeout}s",
             timed_out=True,
         )
+
+
+def _local_testbed() -> Optional[str]:
+    """The local testbed directory, or None to use a container as usual.
+    A configured container or task file always wins over TESTBED_PATH."""
+    if _given_container() or _task_file():
+        return None
+    path = os.environ.get(TESTBED_PATH_ENV)
+    return os.path.abspath(path) if path else None
+
+
+def _local_exec(
+    root: str,
+    command: str,
+    workdir: str,
+    timeout: int,
+    input: Optional[str],
+) -> ExecResult:
+    """docker_exec() for local testbed mode: run `command` on this machine.
+
+    The tools speak in container paths (/testbed/...), so /testbed is mapped
+    to `root` on the way in -- in the command, the workdir, and stdin too,
+    since edit_file sends its path as JSON on stdin -- and back to /testbed
+    in the output, so tools still report /testbed/... paths.
+    """
+
+    def to_local(text):
+        return text.replace(REPO_DIR, root) if text else text
+
+    def to_container(text):
+        return text.replace(root, REPO_DIR) if text else text
+
+    try:
+        result = subprocess.run(
+            ["bash", "-c", to_local(command)],
+            cwd=to_local(workdir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=to_local(input),
+        )
+    except subprocess.TimeoutExpired:
+        return ExecResult(
+            returncode=-1,
+            stdout="",
+            stderr=f"[docker_exec] timed out after {timeout}s",
+            timed_out=True,
+        )
+    return ExecResult(
+        returncode=result.returncode,
+        stdout=to_container(result.stdout),
+        stderr=to_container(result.stderr),
+        timed_out=False,
+    )
 
 
 def _kill_orphan(container: str, marker: str) -> None:

@@ -225,7 +225,7 @@ print(run_tests(code=solution))
 ```
 <end_code>
 Observation:
-[run_tests] 1/1 tests passed
+{"success": true, "output": "test 1: PASS  (assert square(3) == 9)\\n[run_tests] 1/1 tests passed"}
 
 Thought: All tests pass, I submit the solution.
 ```python

@@ -105,10 +105,12 @@ Import restriction:
 """
 from __future__ import annotations
 
+import ast
 import atexit
 import io
 import multiprocessing as mp
 import os
+import sys
 import tempfile
 import queue as queue_module
 import time
@@ -585,7 +587,14 @@ class Sandbox:
         return output
 
     def run_repl(self) -> None:
-        """Read code, execute it, print result. `exit` or EOF quits."""
+        """Read code, execute it, print result. `exit` or EOF quits.
+
+        Piped input (`cat file.py | uv run sandbox`) is a whole file, not
+        typed lines: it goes to _run_piped() instead of the line loop.
+        """
+        if not sys.stdin.isatty():
+            self._run_piped(sys.stdin.read())
+            return
         print("Agent Smith sandbox. Type 'exit' to quit.")
         buffer : List[str] = []
         while True:
@@ -621,6 +630,38 @@ class Sandbox:
                 continue
             if output:
                 print(output, end = "" if output.endswith("\n") else "\n")
+            if self.final_answer_called:
+                print(f"[final_answer] {self.final_answer_value!r}")
+                self.final_answer_called = False
+
+    def _run_piped(self, source: str) -> None:
+        """Run a whole piped file one top-level statement at a time.
+
+        The line loop in run_repl() follows interactive rules, which break
+        on a file: a blank line inside a block ends that block (the rest of
+        it becomes "unexpected indent"), and a block still open at EOF is
+        never run. Splitting with ast uses the file's real structure instead.
+
+        One statement per execute() call, like the REPL: if one statement
+        times out (and the worker is restarted), the ones after it still run.
+        """
+        lines = source.splitlines()
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            chunks = [source]  # run it anyway, so the worker reports the error
+        else:
+            chunks = []
+            for node in tree.body:
+                # A decorated def starts at its first decorator, not at `def`.
+                decorators = getattr(node, "decorator_list", [])
+                start = min([node.lineno] + [d.lineno for d in decorators])
+                chunks.append("\n".join(lines[start - 1:node.end_lineno]))
+
+        for chunk in chunks:
+            output = self.execute(chunk, echo_last_expr=True)
+            if output:
+                print(output, end="" if output.endswith("\n") else "\n")
             if self.final_answer_called:
                 print(f"[final_answer] {self.final_answer_value!r}")
                 self.final_answer_called = False

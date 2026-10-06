@@ -1,16 +1,20 @@
 """
 MBPP MCP tools server (Section V.3, point 2).
 
-Exposes one tool, run_tests(code), which checks a candidate solution
-against the current task's tests.
+Exposes one tool, run_tests(code, test_list=None), which checks a candidate
+solution against the current task's tests, or against `test_list` if given.
+It returns JSON: {"success": <all tests passed>, "output": <per-test report>}.
 
 The task file path comes from the MBPP_TASK_FILE environment variable
-(set by agent_mbpp/__main__.py before this server is launched).
+(set by agent_mbpp/__main__.py before this server is launched). It is only
+needed when `test_list` is not given.
 """
 import json
 import os
+import re
 import subprocess
 import sys
+from typing import List, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -38,6 +42,9 @@ for _i, _t in enumerate(_tests, start=1):
 print(f"[run_tests] {{_passed}}/{{len(_tests)}} tests passed")
 '''
 
+# The harness's last line, used to decide `success`.
+_SUMMARY_LINE = re.compile(r"\[run_tests\] (\d+)/(\d+) tests passed")
+
 
 def _load_current_task() -> dict:
     task_file = os.environ.get(TASK_FILE_ENV)
@@ -50,18 +57,31 @@ def _load_current_task() -> dict:
 
 
 @mcp.tool()
-def run_tests(code: str) -> str:
+def run_tests(code: str, test_list: Optional[List[str]] = None) -> str:
     """Run the task's tests against the given solution code.
 
     Pass the full source code of your solution as `code`, for example:
         print(run_tests(code=solution))
-    Returns a pass/fail line per test and a summary.
+    `test_list` is optional: a list of assert statements to run instead of
+    the task's own tests.
+    Returns JSON: {"success": true/false, "output": "<pass/fail line per test and a summary>"}.
     """
-    task = _load_current_task()
-    test_imports = task.get("test_imports", [])
-    test_list = task.get("test_list", [])
+    output = _run_tests_report(code, test_list)
+    match = _SUMMARY_LINE.search(output)
+    success = bool(match) and match.group(1) == match.group(2)
+    return json.dumps({"success": success, "output": output})
 
-    script = "\n".join(test_imports) + "\n" + code + "\n" + _HARNESS.format(
+
+def _run_tests_report(code: str, test_list: Optional[List[str]]) -> str:
+    """Run the tests in a separate process; return the plain-text report."""
+    if test_list is None:
+        task = _load_current_task()
+        test_imports = task.get("test_imports", [])
+        test_list = task.get("test_list", [])
+    else:
+        test_imports = []
+
+    script ="\n".join(test_imports) + "\n" + code + "\n" + _HARNESS.format(
         tests_json=json.dumps(test_list)
     )
 
