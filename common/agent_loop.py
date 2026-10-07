@@ -16,8 +16,15 @@ STAGE 1 (current): max_iterations, max_input_tokens, max_output_tokens and
   Time limit: the clock starts at `start_time` (the entry point's start, so
   setup such as pulling an image counts). New work stops `safety_margin_seconds`
   before the limit, and every LLM request gets that same deadline, so one slow
-  request cannot run past it. On timeout, `salvage` (if given) may return a
-  partial solution, e.g. the current patch.
+  request cannot run past it.
+
+  Output tokens: each request's max_tokens is capped to what is left of the
+  output budget, so one long reply cannot push the total over the limit.
+
+  Ending without final_answer (timeout, iteration limit, a failed LLM
+  request): `salvage` (if given) returns a partial solution, e.g. the current
+  patch, which is submitted instead of nothing. The run still reports
+  success=False; the evaluator judges the patch itself.
 
 """
 from __future__ import annotations
@@ -27,10 +34,13 @@ from typing import Callable, List, Optional
 
 from common.code_extraction import extract_python_code_block
 from common.llm_provider import LLMProvider
-from common.models import SolutionOutput, StepMetrics
+from common.models import MBPP_BENCHMARK, SWEBENCH_BENCHMARK, SolutionOutput, StepMetrics
 from common.watchdog import run_with_timeout
 
 STOP_SEQUENCES = ["<end_code>"]
+
+# Upper bound for one reply; lowered further when less output budget is left.
+MAX_TOKENS_PER_REQUEST = 1024
 
 
 class AgentLoop:
@@ -86,19 +96,29 @@ class AgentLoop:
             error=error,
         )
 
+    def _salvaged_solution(self) -> str:
+        """What `salvage` returns (e.g. the current patch), or "" if there is
+        no salvage function or no time left to run it."""
+        if self.salvage is None:
+            return ""
+        # Use what is left before the hard limit (at most 20s), keeping
+        # 3s to write the result file.
+        hard_end = self._start + self.timeout_seconds - 3
+        budget = min(20.0, hard_end - time.perf_counter())
+        if budget <= 1:
+            return ""
+        return run_with_timeout(self.salvage, budget) or ""
+
+    def _end_without_answer(self, error: str) -> SolutionOutput:
+        """The loop stopped before final_answer(): submit whatever can be
+        salvaged. Two benchmark runs had passing tests but never submitted."""
+        return self.build_result(False, self._salvaged_solution(), error)
+
     def _timeout_result(self, detail: str = "") -> SolutionOutput:
-        solution = ""
-        if self.salvage is not None:
-            # Use what is left before the hard limit (at most 20s), keeping
-            # 3s to write the result file.
-            hard_end = self._start + self.timeout_seconds - 3
-            budget = min(20.0, hard_end - time.perf_counter())
-            if budget > 1:
-                solution = run_with_timeout(self.salvage, budget) or ""
         message = f"Reached timeout ({self.timeout_seconds}s) before completing"
         if detail:
             message += f": {detail}"
-        return self.build_result(False, solution, message)
+        return self._end_without_answer(message)
 
     def run(self, task_id: str, benchmark: str, user_task: str) -> SolutionOutput:
         self._task_id, self._benchmark = task_id, benchmark
@@ -122,33 +142,45 @@ class AgentLoop:
             if time.perf_counter() >= soft_deadline:
                 return self._timeout_result()
 
+            # Never ask for more output than the budget has left.
+            max_tokens = min(MAX_TOKENS_PER_REQUEST, self.max_output_tokens - total_output_tokens)
+            if max_tokens <= 0:
+                return self._end_without_answer(
+                    f"Output token budget ({self.max_output_tokens}) used up at step {step}"
+                )
             try:
                 response = self.llm_provider.generate(
-                    messages, stop_sequences=STOP_SEQUENCES, deadline=soft_deadline
+                    messages,
+                    stop_sequences=STOP_SEQUENCES,
+                    max_tokens=max_tokens,
+                    deadline=soft_deadline,
                 )
             except Exception as e:
                 out_of_time = isinstance(e, TimeoutError) or time.perf_counter() >= soft_deadline - 1
                 if out_of_time:
                     return self._timeout_result(str(e))
-                return self.build_result(False, "", f"LLM request failed at step {step}: {e}")
+                return self._end_without_answer(f"LLM request failed at step {step}: {e}")
 
             total_input_tokens += response.input_tokens
             total_output_tokens += response.output_tokens
 
             extraction = extract_python_code_block(response.text)
-            if extraction.code is None:
+            # The exact string the sandbox runs; it is also what gets logged
+            # as sandbox_input, so the log can never differ from what ran.
+            code = extraction.code
+            if code is None:
                 # The warning already says what to do (and why nothing was run).
                 observation = extraction.warning or (
                     "No code block found. Reply with 'Thought: ...' followed by a "
                     "```python ... ``` block, then <end_code>."
                 )
             else:
-                observation = self.sandbox.execute(extraction.code) or "(no output, use print())"
+                observation = self.sandbox.execute(code) or "(no output, use print())"
                 if extraction.warning:
                     # Tell the LLM what was interpreted, so it is never left guessing.
                     observation = f"[Note] {extraction.warning}\n{observation}"
-                previous = previous_runs.get(extraction.code)
-                previous_runs[extraction.code] = (step, observation)
+                previous = previous_runs.get(code)
+                previous_runs[code] = (step, observation)
                 if previous is not None and previous[1] == observation:
                     # Weak models can loop on one call until the budget runs out.
                     observation = (
@@ -166,7 +198,7 @@ class AgentLoop:
                     api_url=self.llm_provider.base_url,
                     model_name=self.llm_provider.model_name,
                     llm_output=response.text,
-                    sandbox_input=extraction.code or "",
+                    sandbox_input=code or "",
                     sandbox_output=observation,
                     retries=response.retries,
                 )
@@ -189,8 +221,8 @@ class AgentLoop:
             messages.append({"role": "assistant", "content": response.text or "(empty response)"})
             messages.append({"role": "user", "content": f"Observation:\n{observation}"})
 
-        return self.build_result(
-            False, "", f"Reached max iterations ({self.max_iterations}) without final_answer"
+        return self._end_without_answer(
+            f"Reached max iterations ({self.max_iterations}) without final_answer"
         )
 
 
@@ -199,7 +231,7 @@ def build_system_prompt(sandbox_manual: str, benchmark: str) -> str:
     benchmark-specific instructions with one worked example."""
     tools = sandbox_manual.strip() or "(no extra tools connected)"
 
-    if benchmark == "mbpp":
+    if benchmark == MBPP_BENCHMARK:
         task_instructions = """For mbpp tasks:
 1. Write the requested function as a source-code string. Keep the exact
    function name and parameters from the given signature.
@@ -233,8 +265,8 @@ final_answer(solution)
 ```
 <end_code>
 """
-    elif benchmark == "swebench":
-        task_instructions = """For swebench tasks:
+    elif benchmark == SWEBENCH_BENCHMARK:
+        task_instructions = """For SWE-bench tasks:
 IMPORTANT: this code runs on your host machine, not inside the task's
 container. The target repository (e.g. sympy) is not installed here and
 cannot be imported or run directly -- `import sympy` (or any target-repo

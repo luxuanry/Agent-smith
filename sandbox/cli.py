@@ -67,6 +67,7 @@ def main(argv=None) -> None:
     # stdio: we launch the server ourselves. HTTP: it must already be running.
     mcp_client = MCPClient()
     mcp_functions = {}
+    manual = ""
     if args.mcp_stdio or args.mcp_server:
         try:
             if args.mcp_stdio:
@@ -86,11 +87,12 @@ def main(argv=None) -> None:
             **mcp_client.wrap_as_python_functions(),
             **mcp_client.wrap_resources_and_prompts(),
         }
-        print(generate_sandbox_manual(mcp_client.tools, mcp_client.resources, mcp_client.prompts))
+        manual = generate_sandbox_manual(mcp_client.tools, mcp_client.resources, mcp_client.prompts)
+        print(manual)
 
     try:
         # Must come after discovery: the worker's function names are fixed here.
-        sandbox = Sandbox(config=config, mcp_tools=mcp_functions)
+        sandbox = Sandbox(config=config, mcp_tools=mcp_functions, manual=manual)
         try:
             sandbox.run_repl()
         finally:

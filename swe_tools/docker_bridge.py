@@ -1,11 +1,11 @@
 """
-Shared infrastructure for the SWE-bench MCP tools (swebench_tools/*).
+Shared infrastructure for the SWE-bench MCP tools (swe_tools/*).
 
 Every tool in fs_tools.py / search_tools.py / exec_tools.py needs two
 things: which container to `docker exec` into, and which task it's serving
 (eval_script, repo, instance_id, ...). This module resolves both and
 provides docker_exec(), the single primitive every tool is built on top of,
-plus the shared conventions the whole swebench_tools package follows:
+plus the shared conventions the whole swe_tools package follows:
 
   - Tools never raise. mcp_tools_swebench.py wraps every registered tool in
     never_raise() below, so any exception (a bug, a misconfigured
@@ -21,15 +21,13 @@ Settings (which container, which task) are resolved in this priority order:
   1. --container / --task-file command-line flags, if mcp_tools_swebench.py
      was launched with them directly. Only useful for manual testing.
   2. SWEBENCH_CONTAINER_NAME / SWEBENCH_TASK_FILE environment variables.
-     This is the real path: agent_swebench/__main__.py sets these before
+     This is the real path: the SWE-bench agent entry point sets these before
      spawning mcp_tools_swebench.py, and the sandbox CLI's own
      `--mcp-stdio "python mcp_tools_swebench.py"` invocation never passes
      any command-line flags at all.
-  3. DEFAULT_CACHE_TASK_FILE (cache/swebench_task.json, moulinette's default
-     dump path) plus a container name derived from that task's instance_id
-     via common.docker_env.container_name() -- lets you test the tools in
-     this package standalone against a container you started by hand,
-     without running the full agent_swebench pipeline first.
+If a task file is given but no container, the server starts its own
+container from the task's docker_image (prepare_container()) and removes it
+when it exits (cleanup_container()).
 
 Local testbed mode: if none of the above is set but TESTBED_PATH is, commands
 run on this machine in that directory instead of in a container (see
@@ -203,7 +201,11 @@ def truncate(text: str) -> str:
     omitted = len(text) - TRUNCATE_HEAD_CHARS - TRUNCATE_TAIL_CHARS
     head = text[:TRUNCATE_HEAD_CHARS]
     tail = text[-TRUNCATE_TAIL_CHARS:] if TRUNCATE_TAIL_CHARS else ""
-    return f"{head}\n[... {omitted} characters omitted ...]\n{tail}"
+    return (
+        f"{head}\n[TOOL OUTPUT TRUNCATED: {omitted} characters omitted from the "
+        f"middle; the limit is {TRUNCATE_MAX_CHARS} characters. Ask for less, e.g. "
+        f"a smaller line range or a more specific pattern.]\n{tail}"
+    )
 
 
 # The container runtime prints its own chatter on every single call

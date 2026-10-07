@@ -10,7 +10,7 @@ Five things the sandbox has to hold up under `tests/test_sandbox_security.py`:
                               the worker process starts (executor.py)
 
 Before this, network access was only blocked as a side effect of
-authorized_imports never including socket/urllib/requests/etc. -- true
+authorized_imports never including socket or any HTTP client module -- true
 today, but not a dedicated guarantee: if a networking module is ever
 added to the allowlist for a legitimate reason, access would silently
 reopen with no separate safety net. block_network() patches the actual
@@ -97,8 +97,8 @@ def block_network() -> None:
 
     Patches socket.socket (not just adds "socket" to a blocklist)
     because it's the primitive nearly every higher-level networking
-    path -- sockets directly, socket.create_connection, urllib,
-    http.client, requests via urllib3 -- ultimately constructs. One
+    path -- sockets directly, socket.create_connection, and every HTTP
+    client in the standard library or outside it -- ultimately constructs. One
     patch, one place, covers all of them instead of chasing each
     library separately.
     """

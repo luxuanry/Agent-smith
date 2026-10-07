@@ -1,7 +1,7 @@
 """Execution tools: run_tests / get_patch / run_command (Section V.5.3)."""
 import re
 
-from swebench_tools.docker_bridge import clean_stderr, docker_exec, get_task, to_abs, truncate
+from swe_tools.docker_bridge import clean_stderr, docker_exec, get_task, to_abs, truncate
 
 # The eval script reinstalls the package and runs a whole test suite, so it
 # needs far more than docker_exec's default timeout.

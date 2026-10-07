@@ -2,7 +2,7 @@
 import json
 import shlex
 
-from swebench_tools.docker_bridge import clean_stderr, docker_exec, to_abs, truncate
+from swe_tools.docker_bridge import clean_stderr, docker_exec, to_abs, truncate
 
 TESTBED_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"
 

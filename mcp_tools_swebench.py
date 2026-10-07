@@ -3,9 +3,9 @@ MCP server entry point for SWE-bench tasks (Section V.4 + V.5).
 
 Must live at the repository root (the PDF requires this). This file's only
 job is to register the 9 mandatory tools and start the server -- the actual
-implementations live in swebench_tools/{fs_tools,search_tools,exec_tools}.py,
+implementations live in swe_tools/{fs_tools,search_tools,exec_tools}.py,
 and the shared plumbing (docker_exec, get_container, get_task, to_abs,
-truncate, never_raise) lives in swebench_tools/docker_bridge.py. See that
+truncate, never_raise) lives in swe_tools/docker_bridge.py. See that
 module's docstring for the full set of shared conventions (never raise,
 absolute-path output, truncate everything except get_patch) and for how
 this process learns which container/task to serve.
@@ -22,15 +22,15 @@ import time
 
 from mcp.server.fastmcp import FastMCP
 
-from swebench_tools.docker_bridge import (
+from swe_tools.docker_bridge import (
     cleanup_container,
     never_raise,
     prepare_container,
 )
 
-from swebench_tools.exec_tools import get_patch, run_command, run_tests
-from swebench_tools.fs_tools import edit_file, list_files, read_file
-from swebench_tools.search_tools import (
+from swe_tools.exec_tools import get_patch, run_command, run_tests
+from swe_tools.fs_tools import edit_file, list_files, read_file
+from swe_tools.search_tools import (
     find_references,
     search_code,
     search_function_or_class_definition_in_code,

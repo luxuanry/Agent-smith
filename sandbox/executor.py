@@ -24,8 +24,8 @@ being exec()'d directly inside the agent's own process. Why this changed:
     stuck code required, so this is a real guarantee instead of a
     best-effort one.
   - Real isolation. A segfault, a C-level crash, or the OS OOM-killing the
-    process now only takes down the *worker*, not the whole agent_mbpp /
-    agent_swebench run. Before, a crash inside exec() could kill the
+    process now only takes down the *worker*, not the whole MBPP /
+    SWE-bench agent run. Before, a crash inside exec() could kill the
     entire agent process (or worse, corrupt its state without killing it).
   - Memory limit is now TWO layers instead of one:
       1. security.apply_memory_limit()/reset_memory_limit() (RLIMIT_AS),
@@ -161,7 +161,9 @@ def _cap_output(text: str) -> str:
     omitted = len(text) - _RESULT_OUTPUT_HEAD_CHARS - _RESULT_OUTPUT_TAIL_CHARS
     return (
         text[:_RESULT_OUTPUT_HEAD_CHARS]
-        + f"\n[... {omitted} characters omitted ...]\n"
+        + f"\n[OUTPUT TRUNCATED: {omitted} characters omitted from the middle; the "
+        f"output limit is {_RESULT_OUTPUT_MAX_CHARS} characters. Print less, or "
+        f"print only the part you need.]\n"
         + text[-_RESULT_OUTPUT_TAIL_CHARS:]
     )
 
@@ -312,10 +314,13 @@ def _worker_main(
     tool_names: List[str],
     tool_conn: "Connection",
     output_path: Optional[str] = None,
+    manual: str = "",
+    parent_pid: Optional[int] = None,
 ) -> None:
     """Entry point of the child process. Runs until it receives `None`
-    (shutdown sentinel) or is killed by the parent. Everything in here
-    happens in the child's own memory -- it never touches parent state.
+    (shutdown sentinel), is killed by the parent, or finds that the parent
+    is gone. Everything in here happens in the child's own memory -- it
+    never touches parent state.
     """
     import contextlib
     import io
@@ -355,6 +360,10 @@ def _worker_main(
     namespace["final_answer"] = _final_answer
     for tool_name in tool_names:
         namespace[tool_name] = _make_tool_proxy(tool_name)
+    if manual:
+        # The same text the system prompt shows, readable from inside the
+        # sandbox too: print(sandbox_manual)
+        namespace["sandbox_manual"] = manual
 
     block_network()
     import_guard = ImportGuard(config.authorized_imports)
@@ -363,9 +372,19 @@ def _worker_main(
     harden_builtins(restricted_builtins)
     namespace["__builtins__"] = restricted_builtins
 
+    # Given by the parent rather than read here: if the parent died before
+    # this line ran, os.getppid() would already be the new (adoptive) parent.
+    if parent_pid is None:
+        parent_pid = os.getppid()
     while True:
         try:
-            request = code_queue.get()
+            request = code_queue.get(timeout=1.0)
+        except queue_module.Empty:
+            # The parent was killed without a chance to stop us (kill -9):
+            # exit instead of waiting forever as an orphan.
+            if os.getppid() != parent_pid:
+                break
+            continue
         except (KeyboardInterrupt, EOFError):
             break
         if request is None:  # shutdown sentinel -- test BEFORE unpacking
@@ -410,9 +429,17 @@ def _worker_main(
 
 
 class Sandbox:
-    def __init__(self, config: SandboxConfig, mcp_tools: Optional[Dict[str, Callable]] = None):
+    def __init__(
+        self,
+        config: SandboxConfig,
+        mcp_tools: Optional[Dict[str, Callable]] = None,
+        manual: str = "",
+    ):
         self.config = config
         self.mcp_tools = mcp_tools or {}
+        # Generated from the MCP schemas (sandbox/manual.py); exposed in the
+        # namespace as `sandbox_manual`.
+        self.manual = manual
         self.final_answer_value: Optional[str] = None
         self.final_answer_called: bool = False
         # fork (not spawn): the child inherits everything already imported
@@ -442,6 +469,8 @@ class Sandbox:
                 list(self.mcp_tools),
                 self._worker_tool_conn,
                 self._output_path,
+                self.manual,
+                os.getpid(),
             ),
             daemon=True,
         )
@@ -471,7 +500,11 @@ class Sandbox:
         if len(text) > limit:
             half = limit // 2
             omitted = len(text) - limit
-            text = text[:half] + f"\n[... {omitted} characters omitted ...]\n" + text[-half:]
+            text = (
+                text[:half]
+                + f"\n[OUTPUT TRUNCATED: {omitted} characters omitted from the middle]\n"
+                + text[-half:]
+            )
         return text
 
     def _with_partial(self, message: str) -> str:

@@ -1,20 +1,23 @@
 """
 Docker container lifecycle management (Section V.4).
 
-Pulled out of agent_swebench/__main__.py so it can be reused: agent_swebench
+Pulled out of the SWE-bench entry point so it can be reused: that agent
 uses it to run real evaluation tasks, and if the sandbox CLI (`uv run
 sandbox --mcp-stdio ...`) ever needs to spin up its own container for manual
 debugging, it can just import this module instead of duplicating the
 pull/start/cleanup logic.
 
 The three functions map to the three stages of a container's life: pull the
-image -> start the container -> clean it up when done. Everything calls the
+image -> start the container -> clean it up when done. start_reaper() covers
+the one case the agent cannot clean up itself: being killed with SIGKILL
+(kill -9). Everything calls the
 docker CLI with argument lists (never a shell string), so each argument is
 passed straight to execve -- no escaping to worry about, no shell-injection
 risk.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -91,3 +94,45 @@ def cleanup_container(name: str) -> None:
         capture_output=True,
     )
     subprocess.run(["docker", "rm", name], capture_output=True)
+
+
+# Runs in its own small process (see start_reaper). Waits until its parent,
+# the agent, is gone, then force-removes the container. A few attempts,
+# because the agent may have died while `docker run` was still creating it.
+_REAPER_SCRIPT = """
+import os, subprocess, sys, time
+agent_pid, name = int(sys.argv[1]), sys.argv[2]
+while os.getppid() == agent_pid:
+    time.sleep(0.5)
+for _ in range(5):
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+    if subprocess.run(["docker", "container", "inspect", name], capture_output=True).returncode != 0:
+        break
+    time.sleep(1)
+"""
+
+
+def start_reaper(name: str) -> subprocess.Popen:
+    """Start a watcher process that removes container `name` as soon as this
+    process exits, however it exits.
+
+    Ctrl+C and SIGTERM are handled by the agent itself (it removes the
+    container before exiting), but SIGKILL (kill -9) ends a process
+    instantly: no handler, no `finally`, no atexit. Only another process
+    can clean up after that. The reaper notices its parent is gone when it
+    gets re-parented (os.getppid() changes), which, unlike polling a PID,
+    cannot be fooled by the PID being reused.
+
+    start_new_session=True puts it in its own process group, so the Ctrl+C
+    that interrupts the agent does not kill the reaper too. After a normal
+    exit the container is already gone and its `docker rm -f` does nothing.
+    Call this BEFORE start_container(), so there is no moment where a
+    container exists without a reaper watching over it.
+    """
+    return subprocess.Popen(
+        [sys.executable, "-c", _REAPER_SCRIPT, str(os.getpid()), name],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )

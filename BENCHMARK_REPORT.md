@@ -1,8 +1,7 @@
 # Benchmark Report
 
 All numbers below come from the `solution.json` / `validate.txt` files under
-[`benchmark/runs/`](benchmark/runs/) and were aggregated with
-[`benchmark/aggregate.py`](benchmark/aggregate.py) into
+[`benchmark/runs/`](benchmark/runs/) and were aggregated into
 [`benchmark/tables.md`](benchmark/tables.md).
 
 ## 1. Setup
@@ -39,7 +38,8 @@ just one familiar format.
 ### Procedure
 
 - Each model ran the same agent code (`agent_swebench`) on all three tasks
-  via [`benchmark/run.sh`](benchmark/run.sh). One process ran per task, with
+  (`uv run python -m agent_swebench --task-file ... --output ...`, then
+  `moulinette_eval validate swebench`). One process ran per task, with
   a fresh task container each time.
 - Every run had the same hard limits: 30 iterations, 300k input tokens, 10k
   output tokens, and 900 s. Every request used `temperature = 0`.
@@ -297,3 +297,22 @@ quota.
 - Free-tier limits shaped the results as much as model quality did (5 of 18
   runs, ablation included, were cut by a 429). Provider fallback is therefore a requirement in
   practice, not an optional extra.
+
+## 7. Changes Made After This Benchmark
+
+Two findings above were turned into agent changes. The numbers in this
+report were measured **before** these changes and have not been re-run.
+
+- **Submit the patch even without `final_answer`.** When a SWE-bench run
+  ends on the iteration limit, the timeout, or a failed LLM request (such as
+  the 429s in section 3), the agent now submits the current `get_patch()`
+  diff instead of an empty solution. This targets the two runs in section 4
+  whose tests passed but which never submitted (nemotron / django,
+  north / xarray).
+- **Output budget per request.** Each request's `max_tokens` is now capped
+  to the remaining output budget, so one long reply (gemini / sympy used
+  2,213 output tokens in 3 steps) cannot overshoot the limit by itself.
+
+Not changed: echoing a bare last expression (section 5). It would make the
+agent less dependent on the worked example, but it also changes what every
+observation contains, so it needs its own ablation run first.

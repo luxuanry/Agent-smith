@@ -4,8 +4,9 @@ LLM Provider abstraction.
 The agent loop only calls `provider.generate(messages, stop_sequences=[...])`
 and gets back an `LLMResponse`; it doesn't care which provider is behind it.
 
-STAGE 0 (current): one OpenAI-compatible /chat/completions call,
-key rotation on 429/5xx. No provider fallback yet.
+One OpenAI-compatible /chat/completions call per step, with key rotation
+and retries on 429/5xx. No automatic fallback to another provider: the
+provider is chosen per run (models.json or --provider-url).
 
 Never hardcode API keys: they are read from an environment variable (Section VI.3).
 """
@@ -166,13 +167,21 @@ class LLMProvider:
         usage = data.get("usage") or {}
         choices = data.get("choices") or []
         message = (choices[0].get("message") or {}) if choices else {}
+        input_tokens = usage.get("prompt_tokens") or 0
+        output_tokens = usage.get("completion_tokens") or 0
+        # Some providers leave hidden reasoning ("thinking") tokens out of
+        # completion_tokens but include them in total_tokens. They are still
+        # generated tokens and count toward our output limit, so take the
+        # larger of the two readings; never under-report.
+        total_tokens = usage.get("total_tokens") or 0
+        output_tokens = max(output_tokens, total_tokens - input_tokens)
         # Google omits "content" entirely when the output is empty (for example
         # finish_reason "length"). That is a normal reply, not an error: return
         # empty text and let the agent loop ask the model to try again.
         return LLMResponse(
             text=message.get("content") or "",
-            input_tokens=usage.get("prompt_tokens", 0),
-            output_tokens=usage.get("completion_tokens", 0),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             request_time_ms=(time.perf_counter() - start) * 1000,
             retries=retries,
         )

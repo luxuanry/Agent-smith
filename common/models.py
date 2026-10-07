@@ -13,6 +13,10 @@ from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
+# The two values SolutionOutput.benchmark can take.
+MBPP_BENCHMARK = "mbpp"
+SWEBENCH_BENCHMARK = "swebench"
+
 
 # --------------------------------------------------------------------------
 # Sandbox configuration (Section V.2)
@@ -61,7 +65,7 @@ class MBPPTaskInput(BaseModel):
 # SWE-bench task input (Section V.4)
 # --------------------------------------------------------------------------
 class SWEBenchTaskInput(BaseModel):
-    """Input for a SWE-bench task, provided by the moulinette.
+    """Input for a SWE-bench task, provided by the evaluation tooling.
 
     Your agent receives this and must produce a git patch that fixes the issue.
     """

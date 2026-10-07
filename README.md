@@ -146,11 +146,17 @@ Leave off `--task-id` to dump a random instance instead of a fixed one.
 `agent_swebench` pulls the task's image, starts a container named
 `agent-smith-<instance_id>`, runs the agent, writes the result file, and then
 always stops and removes the container, whether the run succeeded or not.
+The container is also removed when the run is interrupted:
 
-### Running the tests
-```bash
-uv run --extra dev pytest tests/
-```
+| How the run ends | Who removes the container |
+|---|---|
+| Normal end, or an exception | `agent_swebench` itself, right after writing the result |
+| Ctrl+C, `SIGTERM`, `SIGHUP` | `agent_swebench` itself: the signals are turned into `KeyboardInterrupt`, the result is written with an `Interrupted` error, then the same cleanup runs (exit code 130) |
+| Hard time limit | the watchdog thread, before it ends the process |
+| `kill -9` | a small **reaper** process started next to the container (`common/docker_env.start_reaper`). `SIGKILL` cannot be caught, so another process has to do it: the reaper notices its parent is gone and runs `docker rm -f` |
+
+The sandbox worker and the MCP server also exit on their own when the agent
+process disappears, so no process is left behind either.
 
 ### Exploring a SWE-bench container by hand
 
@@ -233,8 +239,9 @@ docker rm sympy-14711
 | Sandbox | `sandbox/executor.py`, `sandbox/security.py` | Runs the LLM's code with restrictions |
 | Sandbox manual | `sandbox/manual.py` | Turns the server's tool list into text for the system prompt |
 | MCP client | `sandbox/mcp_client.py` | Connects to any MCP server, lists its tools, calls them |
-| MCP servers | `mcp_tools_mbpp.py`, `mcp_tools_swebench.py`, `swebench_tools/` | The tools themselves |
-| Container lifecycle | `common/docker_env.py` | Pull image, start container, clean up |
+| MCP servers | `mcp_tools_mbpp.py`, `mcp_tools_swebench.py`, `swe_tools/` | The tools themselves |
+| Container lifecycle | `common/docker_env.py` | Pull image, start container, clean up, reaper for `kill -9` |
+| Process lifetime | `common/watchdog.py` | Hard time limit, write-once result file, signal handling |
 | Data models | `common/models.py` | Pydantic models whose fields are fixed by the subject |
 
 The MCP server runs **on the host**, not inside the container. Only the
@@ -270,16 +277,27 @@ Then, for each step:
 | Max output tokens (cumulative) | 1,500 | 10,000 |
 | Timeout | 120 s | 900 s |
 
-Token limits are summed over all steps. The timeout is checked before each new
-LLM call. When a limit is reached, the run stops with `success=False` and an
-`error` explaining which limit was hit. Every step is recorded as a
-`StepMetrics` entry (tokens, time, model, raw LLM output, sandbox input and
-output, retries).
+Token limits are summed over all steps. Each request's `max_tokens` is capped
+to what is left of the output budget, so a single long reply cannot push the
+total over the limit. The timeout is checked before each new LLM call. When a
+limit is reached, the run stops with `success=False` and an `error`
+explaining which limit was hit. Every step is recorded as a `StepMetrics`
+entry (tokens, time, model, raw LLM output, sandbox input and output,
+retries). `sandbox_input` is the exact string the sandbox ran, the same
+variable that is passed to `Sandbox.execute()`.
+
+**Ending without `final_answer`.** If the SWE-bench run stops because of the
+iteration limit, the timeout or a failed LLM request, the current
+`get_patch()` diff is submitted anyway (still with `success=False`). The
+benchmark showed two runs where the tests already passed but the model never
+submitted; their work is no longer thrown away.
 
 **Reasoning tokens.** Reasoning tokens count toward the output limit, so the
 provider asks models to think as little as the API allows
-(`reasoning.enabled=false` on OpenRouter, `thinkingLevel: "low"` on Gemini),
-and Gemini's thinking tokens are added to the reported output count.
+(`reasoning.enabled=false` on OpenRouter, `reasoning_effort="none"` on
+Gemini). If a provider reports hidden reasoning tokens only in
+`total_tokens`, the difference is counted as output too, so the reported
+output count is never too low.
 
 **System prompt.** `build_system_prompt()` combines:
 - the response format (Thought, code block, `<end_code>`) and general rules
@@ -302,8 +320,7 @@ simply becomes an error observation. Variables defined in one step stay
 available in the next, because the worker keeps its own namespace between
 calls. If a worker has to be replaced, that namespace is lost.
 
-**The four guards** (`sandbox/security.py`, tested in
-`tests/test_sandbox_security.py`):
+**The four guards** (`sandbox/security.py`):
 
 | Guard | How it works |
 |---|---|
@@ -330,6 +347,22 @@ outside the sandbox's restrictions, which is intended: they are trusted code.
 
 **`final_answer`** is built into the sandbox, not an MCP tool. Calling it
 records the answer and tells the loop to stop.
+
+**`sandbox_manual`.** The manual generated from the connected server's
+schemas (the same text the system prompt contains) is also a variable inside
+the sandbox: `print(sandbox_manual)`.
+
+**Feedback to the LLM.** The observation always says what happened:
+
+| Situation | What the LLM sees |
+|---|---|
+| No code block in the reply | `No code block found. Reply with ...` |
+| Malformed block / other syntax interpreted | `[Note] ...` explaining what was run (e.g. the unclosed block, or the XML/JSON call converted to Python) |
+| Timeout | the output printed so far, then `[TIMEOUT] Execution exceeded Ns ...` |
+| Memory limit | the output printed so far, then `[MEMORY LIMIT] ...` |
+| Output too long | `[OUTPUT TRUNCATED: N characters omitted ...]` (sandbox) or `[TOOL OUTPUT TRUNCATED: ...]` (SWE-bench tools) |
+| Edit breaks the syntax | `edit_file` compiles the file and adds a `[warning]` with the syntax error |
+| Same code, same result twice | `[Note] You already ran exactly this code ...` |
 
 ## Tool Implementation Details
 
@@ -367,10 +400,10 @@ PASS/FAIL/ERROR line per test and a summary such as
 
 | File | Tools |
 |---|---|
-| `swebench_tools/fs_tools.py` | `read_file`, `edit_file`, `list_files` |
-| `swebench_tools/search_tools.py` | `search_code`, `search_function_or_class_definition_in_code`, `find_references` |
-| `swebench_tools/exec_tools.py` | `run_tests`, `get_patch`, `run_command` |
-| `swebench_tools/docker_bridge.py` | shared helpers used by all tools |
+| `swe_tools/fs_tools.py` | `read_file`, `edit_file`, `list_files` |
+| `swe_tools/search_tools.py` | `search_code`, `search_function_or_class_definition_in_code`, `find_references` |
+| `swe_tools/exec_tools.py` | `run_tests`, `get_patch`, `run_command` |
+| `swe_tools/docker_bridge.py` | shared helpers used by all tools |
 
 **Shared rules** (`docker_bridge.py`):
 
@@ -412,7 +445,7 @@ PASS/FAIL/ERROR line per test and a summary such as
 
 | Tool | What it does |
 |---|---|
-| `run_tests()` | Runs the task's `eval_script`. The script is base64-encoded on the host and decoded in the container (it contains quotes, heredocs and patch text that would not survive being pasted into a command), written to `/tmp` (a file in `/testbed` would end up in the diff), and run with a 300 s timeout. Returns a summary instead of the full log: passed/failed/error counts, names of failing tests, and the last 25 lines. Understands both pytest output and sympy's own `bin/test` output. |
+| `run_tests()` | Runs the task's `eval_script`. The script is sent to the container on stdin (it contains quotes, heredocs and patch text that would not survive being pasted into a command), written to `/tmp` (a file in `/testbed` would end up in the diff), and run with a 300 s timeout. Returns a summary instead of the full log: passed/failed/error counts, names of failing tests, and the last 25 lines. Understands both pytest output and sympy's own `bin/test` output. |
 | `get_patch()` | Returns `git -c core.fileMode=false diff`. This is the agent's answer, so it is **never truncated** (a cut diff cannot be applied). `core.fileMode=false` leaves permission-only changes out. |
 | `run_command(command, workdir)` | Runs any shell command in the container. Returns `exit_code`, `stdout` and `stderr` separately, since a failing command can still print useful information. |
 
@@ -460,10 +493,17 @@ understood by the team before being kept.
 - **Explaining concepts:** MCP, Docker, the `ast` module, `multiprocessing`,
   shell quoting, and the existing code, explained step by step.
 - **SWE-bench tools:** design discussions (AST instead of grep for
-  definitions, base64 for the eval script, writing it to `/tmp`), debugging
+  definitions, passing the eval script on stdin, writing it to `/tmp`), debugging
   (the missing `-i` flag in `docker exec`), and translating code comments to
   English. Every tool was then tested by hand in the sandbox on a real task.
-- **LLM provider:** help adding native Gemini API support to
-  `common/llm_provider.py`, tested with real API calls.
+- **LLM provider:** help adding Gemini support (through Google's
+  OpenAI-compatible endpoint) to `common/llm_provider.py`, tested with real
+  API calls.
+- **Evaluation check:** going through the evaluation scale item by item,
+  then fixing what it found: container cleanup on Ctrl+C / `SIGTERM` /
+  `kill -9` (the reaper), submitting the current patch when the loop ends
+  without `final_answer`, capping `max_tokens` to the remaining budget, and
+  exposing `sandbox_manual`. Each fix was verified with the exam scripts in
+  a Linux container.
 - **Documentation:** first draft of this README, written from the code and
   then reviewed by the team.

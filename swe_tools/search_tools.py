@@ -3,7 +3,7 @@ find_references (Section V.5.2)."""
 import re
 import shlex
 
-from swebench_tools.docker_bridge import REPO_DIR, clean_stderr, docker_exec, to_abs, truncate
+from swe_tools.docker_bridge import REPO_DIR, clean_stderr, docker_exec, to_abs, truncate
 
 # A broad pattern can match thousands of lines; showing the first hundred
 # and saying so is more useful to the LLM than a wall of text.
@@ -80,7 +80,10 @@ def _format_matches(grep_output: str, skip: tuple = ()) -> str:
     total = len(lines)
     if total > MAX_MATCHES:
         lines = lines[:MAX_MATCHES]
-        lines.append(f"... [{total - MAX_MATCHES} more matches; narrow your search]")
+        lines.append(
+            f"[OUTPUT TRUNCATED: showing the first {MAX_MATCHES} of {total} matches; "
+            f"narrow your search]"
+        )
     return truncate("\n".join(lines))
 
 

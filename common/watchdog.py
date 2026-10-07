@@ -1,11 +1,45 @@
-"""Hard time limit helpers: a write-once result file, a watchdog timer,
-and a helper to run a function with a time budget."""
+"""Process lifetime helpers: a write-once result file, a watchdog timer,
+a helper to run a function with a time budget, and signal handling so an
+interrupted run still cleans up after itself."""
 from __future__ import annotations
 
 import os
+import signal
 import threading
 import time
 from typing import Callable, Optional
+
+# Signals that should stop the agent the same way Ctrl+C does.
+_TERMINATION_SIGNALS = (signal.SIGTERM, signal.SIGHUP)
+
+
+def interrupt_on_termination_signals() -> None:
+    """Make SIGTERM and SIGHUP behave like Ctrl+C (SIGINT): raise
+    KeyboardInterrupt in the main thread.
+
+    By default SIGTERM kills Python on the spot, without running `finally`
+    blocks or atexit handlers, so a task container would be left running.
+    Turning it into KeyboardInterrupt sends all three signals down the one
+    cleanup path in the entry point. (SIGKILL cannot be caught at all; see
+    common/docker_env.start_reaper() for that case.)
+    """
+
+    def _raise(signum, frame):
+        raise KeyboardInterrupt(f"received {signal.Signals(signum).name}")
+
+    for sig in _TERMINATION_SIGNALS:
+        signal.signal(sig, _raise)
+    # A process started in the background by a non-interactive shell begins
+    # with SIGINT ignored, and Python keeps it that way. Ask for the normal
+    # Ctrl+C behavior explicitly so `kill -INT` works there too.
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+
+def ignore_interrupts() -> None:
+    """Called once cleanup has started: a second Ctrl+C (or SIGTERM) must not
+    cut the cleanup short and leave the container behind."""
+    for sig in (signal.SIGINT, *_TERMINATION_SIGNALS):
+        signal.signal(sig, signal.SIG_IGN)
 
 
 class ResultWriter:

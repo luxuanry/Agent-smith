@@ -1,12 +1,12 @@
 """
 SWE-bench Agent CLI (Section V.4 point 1).
 
-Usage:
-    uv run python -m agent_swebench --task-file ../cache/swebench_task.json \
-        --output ../cache/swebench_solution.json \
+Usage (from the repository root; full examples in the README, section
+"Running the SWE-bench agent"):
+    uv run python -m <this package> --task-file TASK.json --output SOLUTION.json \
         --model-name "model/name" --provider-url "https://provider.api/v1"
     # or pick the provider from models.json (or omit both for its default):
-    uv run python -m agent_swebench --task-file ... --output ... \
+    uv run python -m <this package> --task-file ... --output ... \
         --provider gemini --model-name gemini-3.6-flash
 
 Mirrors agent_mbpp/__main__.py: same AgentLoop / build_system_prompt /
@@ -20,7 +20,15 @@ file additionally has to:
      task file (eval_script etc.) is, via environment variables -- same
      pattern as MBPP_TASK_FILE in agent_mbpp/__main__.py
   3. always clean the container up afterwards (stop + rm), success or not --
-     exam_swebench.sh grades "container cleanup" as its own step
+     the SWE-bench exam grades "container cleanup" as its own step
+
+Container cleanup, by the way the run ends:
+  - normal end or an exception: cleanup_container() after the result is written
+  - Ctrl+C / SIGTERM / SIGHUP: turned into KeyboardInterrupt, which ends the
+    run through the same path (result written, then cleanup), exit code 130
+  - hard time limit: the watchdog removes it before os._exit
+  - kill -9: nothing in this process runs, so a separate reaper process
+    (common/docker_env.start_reaper) removes it once this process is gone
 
 Time limit: the clock starts here (so pulling the image counts). On timeout
 the agent tries to salvage the current patch, and a watchdog guarantees the
@@ -35,12 +43,24 @@ import sys
 import time
 
 from common.agent_loop import AgentLoop, build_system_prompt
-from common.docker_env import cleanup_container, container_name, pull_image, start_container
+from common.docker_env import (
+    cleanup_container,
+    container_name,
+    pull_image,
+    start_container,
+    start_reaper,
+)
 from common.env import load_env_file
 from common.llm_provider import LLMProvider
 from common.model_config import DEFAULT_MODELS_CONFIG, resolve_model
-from common.models import SandboxConfig, SolutionOutput, SWEBenchTaskInput
-from common.watchdog import ResultWriter, run_with_timeout, start_watchdog
+from common.models import SWEBENCH_BENCHMARK, SandboxConfig, SolutionOutput, SWEBenchTaskInput
+from common.watchdog import (
+    ResultWriter,
+    ignore_interrupts,
+    interrupt_on_termination_signals,
+    run_with_timeout,
+    start_watchdog,
+)
 from sandbox.executor import Sandbox, emergency_cleanup
 from sandbox.manual import generate_sandbox_manual
 from sandbox.mcp_client import MCPClient
@@ -61,7 +81,7 @@ CONTAINER_NAME_ENV = "SWEBENCH_CONTAINER_NAME"
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="agent_swebench")
+    parser = argparse.ArgumentParser(prog=__package__)
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--output", required=True)
     # Provider/model: either explicit (--model-name + --provider-url) or
@@ -89,6 +109,9 @@ def build_user_task(task: SWEBenchTaskInput) -> str:
 def main(argv=None) -> None:
     args = parse_args(argv)
     load_env_file(".env")
+    # SIGTERM/SIGHUP raise KeyboardInterrupt like Ctrl+C does, so every
+    # interruption reaches the cleanup below.
+    interrupt_on_termination_signals()
     start = time.perf_counter()
     task_id = "unknown"
     mcp_client = MCPClient()
@@ -99,7 +122,7 @@ def main(argv=None) -> None:
     def failure_result(error: str) -> SolutionOutput:
         return SolutionOutput(
             task_id=task_id,
-            benchmark="swebench",
+            benchmark=SWEBENCH_BENCHMARK,
             success=False,
             solution="",
             iterations=0,
@@ -125,6 +148,7 @@ def main(argv=None) -> None:
     # write whatever we have, remove the container, and stop the process.
     start_watchdog(TIMEOUT_SECONDS - WATCHDOG_MARGIN_SECONDS, start, on_expire)
 
+    interrupted = False
     try:
         with open(args.task_file, encoding="utf-8") as f:
             task = SWEBenchTaskInput(**json.load(f))
@@ -132,6 +156,8 @@ def main(argv=None) -> None:
 
         container = container_name(task.instance_id)
         pull_image(task.docker_image)
+        # Before the container exists, so it is never left without one.
+        start_reaper(container)
         start_container(task.docker_image, container)
 
         # mcp_tools_swebench.py needs to know which container to `docker
@@ -161,14 +187,17 @@ def main(argv=None) -> None:
             args.model_config, args.provider, args.model_name, args.provider_url, args.api_key_env
         )
         provider = LLMProvider(model_name, provider_url, api_key_env)
-        sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools)
-        system_prompt = build_system_prompt(sandbox_manual=sandbox_manual, benchmark="swebench")
+        sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools, manual=sandbox_manual)
+        system_prompt = build_system_prompt(sandbox_manual=sandbox_manual, benchmark=SWEBENCH_BENCHMARK)
 
         def salvage() -> str:
-            """On timeout, return the current diff so work already done is not lost."""
+            """When the loop ends without final_answer (timeout, iteration
+            limit, failed request), return the current diff so work already
+            done is not lost. Only a real diff counts: get_patch() answers
+            with a message, not a diff, on errors or when nothing changed."""
             patch = wrapped_tools["get_patch"]()
             text = str(patch) if patch is not None else ""
-            return "" if text.startswith("[error]") else text
+            return text if text.startswith("diff --git") else ""
 
         agent = AgentLoop(
             llm_provider=provider,
@@ -183,9 +212,19 @@ def main(argv=None) -> None:
             salvage=salvage,
         )
         state["agent"] = agent
-        result = agent.run(task_id=task_id, benchmark="swebench", user_task=build_user_task(task))
+        result = agent.run(task_id=task_id, benchmark=SWEBENCH_BENCHMARK, user_task=build_user_task(task))
+    except KeyboardInterrupt as e:
+        # Ctrl+C, or SIGTERM/SIGHUP (see interrupt_on_termination_signals).
+        interrupted = True
+        ignore_interrupts()
+        agent = state["agent"]
+        error = f"Interrupted ({str(e) or 'received SIGINT'}) before completing"
+        result = agent.build_result(False, "", error) if agent else failure_result(error)
     except Exception as e:
         result = failure_result(f"{type(e).__name__}: {e}")
+
+    # From here on, a second Ctrl+C must not stop the cleanup halfway.
+    ignore_interrupts()
 
     # Write the result BEFORE attempting any cleanup, so a cleanup failure
     # (MCP subprocess or Docker) can never cause us to lose a task result we
@@ -203,6 +242,9 @@ def main(argv=None) -> None:
 
     if container is not None:
         cleanup_container(container)
+
+    if interrupted:
+        sys.exit(130)  # the usual exit status for a run stopped by Ctrl+C
 
 
 if __name__ == "__main__":

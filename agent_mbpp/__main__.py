@@ -27,8 +27,13 @@ from common.agent_loop import AgentLoop, build_system_prompt
 from common.env import load_env_file
 from common.llm_provider import LLMProvider
 from common.model_config import DEFAULT_MODELS_CONFIG, resolve_model
-from common.models import MBPPTaskInput, SandboxConfig, SolutionOutput
-from common.watchdog import ResultWriter, start_watchdog
+from common.models import MBPP_BENCHMARK, MBPPTaskInput, SandboxConfig, SolutionOutput
+from common.watchdog import (
+    ResultWriter,
+    ignore_interrupts,
+    interrupt_on_termination_signals,
+    start_watchdog,
+)
 from sandbox.executor import Sandbox, emergency_cleanup
 from sandbox.manual import generate_sandbox_manual
 from sandbox.mcp_client import MCPClient
@@ -44,7 +49,7 @@ WATCHDOG_MARGIN_SECONDS = 5  # hard stop this long before the limit
 
 
 def parse_args(argv=None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="agent_mbpp")
+    parser = argparse.ArgumentParser(prog=__package__)
     parser.add_argument("--task-file", required=True)
     parser.add_argument("--output", required=True)
     # Provider/model: either explicit (--model-name + --provider-url) or
@@ -72,6 +77,9 @@ def build_user_task(task: MBPPTaskInput) -> str:
 def main(argv=None) -> None:
     args = parse_args(argv)
     load_env_file(".env")
+    # SIGTERM/SIGHUP raise KeyboardInterrupt like Ctrl+C does, so an
+    # interrupted run still writes its result and closes the MCP server.
+    interrupt_on_termination_signals()
     start = time.perf_counter()
     task_id = "unknown"
     mcp_client = MCPClient()
@@ -81,7 +89,7 @@ def main(argv=None) -> None:
     def failure_result(error: str) -> SolutionOutput:
         return SolutionOutput(
             task_id=task_id,
-            benchmark="mbpp",
+            benchmark=MBPP_BENCHMARK,
             success=False,
             solution="",
             iterations=0,
@@ -103,6 +111,7 @@ def main(argv=None) -> None:
     # write whatever we have and stop the process before the limit.
     start_watchdog(TIMEOUT_SECONDS - WATCHDOG_MARGIN_SECONDS, start, on_expire)
 
+    interrupted = False
     try:
         with open(args.task_file, encoding="utf-8") as f:
             task = MBPPTaskInput(**json.load(f))
@@ -137,8 +146,8 @@ def main(argv=None) -> None:
             args.model_config, args.provider, args.model_name, args.provider_url, args.api_key_env
         )
         provider = LLMProvider(model_name, provider_url, api_key_env)
-        sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools)
-        system_prompt = build_system_prompt(sandbox_manual=sandbox_manual, benchmark="mbpp")
+        sandbox = Sandbox(config=SandboxConfig(), mcp_tools=wrapped_tools, manual=sandbox_manual)
+        system_prompt = build_system_prompt(sandbox_manual=sandbox_manual, benchmark=MBPP_BENCHMARK)
 
         agent = AgentLoop(
             llm_provider=provider,
@@ -152,9 +161,19 @@ def main(argv=None) -> None:
             safety_margin_seconds=SAFETY_MARGIN_SECONDS,
         )
         state["agent"] = agent
-        result = agent.run(task_id=task_id, benchmark="mbpp", user_task=build_user_task(task))
+        result = agent.run(task_id=task_id, benchmark=MBPP_BENCHMARK, user_task=build_user_task(task))
+    except KeyboardInterrupt as e:
+        # Ctrl+C, or SIGTERM/SIGHUP (see interrupt_on_termination_signals).
+        interrupted = True
+        ignore_interrupts()
+        agent = state["agent"]
+        error = f"Interrupted ({str(e) or 'received SIGINT'}) before completing"
+        result = agent.build_result(False, "", error) if agent else failure_result(error)
     except Exception as e:
         result = failure_result(f"{type(e).__name__}: {e}")
+
+    # From here on, a second Ctrl+C must not stop the cleanup halfway.
+    ignore_interrupts()
 
     # Write the result BEFORE attempting any cleanup, so a cleanup failure
     # (e.g. shutting down the MCP subprocess) can never cause us to lose a
@@ -170,6 +189,9 @@ def main(argv=None) -> None:
         mcp_client.close()
     except Exception as e:
         print(f"[warning] MCP client cleanup failed: {type(e).__name__}: {e}", file=sys.stderr)
+
+    if interrupted:
+        sys.exit(130)  # the usual exit status for a run stopped by Ctrl+C
 
 
 if __name__ == "__main__":
