@@ -237,7 +237,8 @@ def build_system_prompt(sandbox_manual: str, benchmark: str) -> str:
    function name and parameters from the given signature.
 2. Check it with the official tests: print(run_tests(code=solution))
 3. If a test fails, fix the code and run the tests again.
-4. When all tests pass, submit the source string with final_answer(solution).
+4. Only after the Observation shows that all tests pass, submit the source
+   string with final_answer(solution) in a new code block.
 Do not hard-code the expected outputs of the tests: implement the general
 logic described in the task, since hidden tests are also used for grading.
 
@@ -284,8 +285,9 @@ connected to the container.
    more than once.
 3. Verify with run_tests(). If it fails, keep editing and re-running
    run_tests() until it passes, or you understand why it still can't.
-4. When done, call get_patch() to get the diff of your changes, then submit
-   it as-is with final_answer(patch). Never write the diff text yourself --
+4. Once an Observation shows run_tests() passing, call get_patch() to get
+   the diff of your changes in a new code block, then submit it as-is with
+   final_answer(patch). Never write the diff text yourself --
    only submit exactly what get_patch() returned.
 Explore before you edit: read enough of the surrounding code to understand
 what you're changing, and only touch what's needed to fix the issue.
@@ -354,6 +356,9 @@ Rules:
 - exec(), eval() and compile() are not available.
 - Always call tools with keyword arguments, e.g. run_tests(code=solution).
 - When you are done, call final_answer(answer) inside a code block.
+- Never call final_answer() in the same code block as run_tests(): first run
+  the tests and read their Observation, then submit in a separate turn, and
+  only if the tests passed.
 
 Always available:
 - final_answer(answer: str) -> None : submit your final answer and end the task.
