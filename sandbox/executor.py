@@ -338,9 +338,21 @@ def _worker_main(
     namespace: Dict[str, Any] = {}
     final_answer_state: Dict[str, Any] = {"called": False, "value": None}
 
-    def _final_answer(answer: str) -> None:
-        """Built into the sandbox, not an MCP tool (Section V.2)."""
-        final_answer_state["value"] = str(answer)
+    def _final_answer(*args, **kwargs) -> None:
+        """Built into the sandbox, not an MCP tool (Section V.2).
+
+        Takes exactly one value. Models are told to call tools with keyword
+        arguments and often write final_answer(patch=...) or
+        final_answer(solution=...), so any single keyword name is accepted,
+        not only `answer`: refusing it wastes a step on a TypeError.
+        """
+        values = list(args) + list(kwargs.values())
+        if len(values) != 1:
+            raise TypeError(
+                f"final_answer() takes exactly one value, got {len(values)}; "
+                "call it as final_answer(solution) or final_answer(get_patch())"
+            )
+        final_answer_state["value"] = str(values[0])
         final_answer_state["called"] = True
 
     def _make_tool_proxy(tool_name: str) -> Callable:

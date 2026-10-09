@@ -26,8 +26,10 @@ strings, printed so the result reaches the LLM, e.g. a non-Python call to
 read_file becomes:
     print(read_file(filepath="/testbed/file.py"))
 
-If a single response mixes several formats, the extracted snippets are
-concatenated in the order they appear in the original text.
+Only the first ```python block of a response is run; further blocks are
+skipped and the warning says so. If a single response mixes several
+formats, the extracted snippets are concatenated in the order they appear
+in the original text.
 
 Feedback to the LLM (V.1: "The LLM should never be left guessing"):
 whenever the extraction had to interpret something, `warning` says exactly
@@ -215,18 +217,29 @@ def extract_python_code_block(llm_text: str) -> ExtractionResult:
     events: List[Tuple[int, str]] = []
     notes: List[str] = []
 
-    # 1) Properly closed ```python blocks.
-    last_end = 0
-    for m in _PY_BLOCK_RE.finditer(llm_text):
-        events.append((m.start(), m.group(1).strip()))
-        last_end = m.end()
+    # 1) Properly closed ```python blocks: only the first one runs. A model
+    # that writes search + edit + run_tests as three blocks in one reply
+    # edits code it has not read yet, since every block after the first is
+    # planned without its predecessor's Observation.
+    blocks = list(_PY_BLOCK_RE.finditer(llm_text))
+    last_end = blocks[-1].end() if blocks else 0
+    if blocks:
+        events.append((blocks[0].start(), blocks[0].group(1).strip()))
+        skipped = len(blocks) - 1 + (1 if _PY_OPEN_RE.search(llm_text[last_end:]) else 0)
+        if skipped:
+            notes.append(
+                f"Your reply had {skipped + 1} ```python blocks; only the first "
+                f"was run and the other {skipped} ignored. Write one block per "
+                f"turn and wait for its Observation before the next step."
+            )
 
-    # 2) A ```python block that was opened but never closed.
-    open_match = _PY_OPEN_RE.search(llm_text[last_end:])
+    # 2) A ```python block that was opened but never closed (only when no
+    # block was closed: otherwise it was skipped above).
+    open_match = None if blocks else _PY_OPEN_RE.search(llm_text)
     if open_match:
         code = _END_CODE_TAIL_RE.sub("", open_match.group(1)).strip()
         if code:
-            events.append((last_end + open_match.start(), code))
+            events.append((open_match.start(), code))
             notes.append(
                 "Your ```python block had no closing ```, so I ran everything after "
                 "it. If your reply was cut off, the code may be incomplete: keep "

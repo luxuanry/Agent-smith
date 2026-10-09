@@ -285,10 +285,12 @@ connected to the container.
    more than once.
 3. Verify with run_tests(). If it fails, keep editing and re-running
    run_tests() until it passes, or you understand why it still can't.
-4. Once an Observation shows run_tests() passing, call get_patch() to get
-   the diff of your changes in a new code block, then submit it as-is with
-   final_answer(patch). Never write the diff text yourself --
-   only submit exactly what get_patch() returned.
+   run_tests() temporarily adds the official tests while it runs and
+   removes them afterwards, so a test name in its output may not exist in
+   the repository: do not go looking for it.
+4. Once an Observation shows run_tests() passing, submit in a new code
+   block with final_answer(get_patch()). Never type or copy the diff
+   yourself: only get_patch()'s own return value is a valid patch.
 Explore before you edit: read enough of the surrounding code to understand
 what you're changing, and only touch what's needed to fix the issue.
 
@@ -319,8 +321,8 @@ Thought: I fix it to special-case zero, then re-run the tests.
 ```python
 print(edit_file(
     filepath="/testbed/sympy/physics/vector/vector.py",
-    old_str="    def __add__(self, other):\n        return Vector(self.args + other.args)",
-    new_str="    def __add__(self, other):\n        if other == 0:\n            return self\n        return Vector(self.args + other.args)",
+    old_str="    def __add__(self, other):\\n        return Vector(self.args + other.args)",
+    new_str="    def __add__(self, other):\\n        if other == 0:\\n            return self\\n        return Vector(self.args + other.args)",
 ))
 print(run_tests())
 ```
@@ -328,10 +330,9 @@ print(run_tests())
 Observation:
 [run_tests] tests passed
 
-Thought: Tests pass, I get the diff and submit it.
+Thought: Tests pass, I submit the diff.
 ```python
-patch = get_patch()
-final_answer(patch)
+final_answer(get_patch())
 ```
 <end_code>
 """
@@ -352,9 +353,14 @@ Rules:
   Only what you print() is visible, so print the results you need.
 - Variables and functions you define persist between turns.
 - Never write the Observation yourself; stop after <end_code>.
+- Write exactly ONE ```python block per turn, then stop. Only the first block
+  of a reply is executed: plan one step, run it, and decide the next step
+  from its Observation.
 - Keep your answers short: your total output is limited.
 - exec(), eval() and compile() are not available.
 - Always call tools with keyword arguments, e.g. run_tests(code=solution).
+  The one exception is final_answer, which takes a single value passed
+  positionally: final_answer(solution), final_answer(get_patch()).
 - When you are done, call final_answer(answer) inside a code block.
 - Never call final_answer() in the same code block as run_tests(): first run
   the tests and read their Observation, then submit in a separate turn, and
@@ -362,6 +368,7 @@ Rules:
 
 Always available:
 - final_answer(answer: str) -> None : submit your final answer and end the task.
+  Pass the value positionally, e.g. final_answer(solution).
 
 Other tools:
 {tools}
