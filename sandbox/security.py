@@ -141,6 +141,16 @@ def build_restricted_builtins(allowed_directories: Iterable[str]) -> dict:
     return safe_builtins
 
 
+def _current_address_space_bytes() -> int:
+    """Virtual size of this process right now (Linux: /proc/self/statm).
+    0 where /proc isn't available (macOS)."""
+    try:
+        with open("/proc/self/statm") as f:
+            pages = int(f.read().split()[0])
+        return pages * os.sysconf("SC_PAGE_SIZE")
+    except (OSError, ValueError, IndexError):
+        return 0
+
 def apply_memory_limit(max_memory_mb: int) -> None:
     """Cap this process's total address space by lowering the SOFT
     RLIMIT_AS only -- the hard limit is left untouched (usually
@@ -161,7 +171,7 @@ def apply_memory_limit(max_memory_mb: int) -> None:
     """
     if max_memory_mb <= 0:
         return  # 0 or negative means "no limit" -- don't call setrlimit(0)
-    limit_bytes = max_memory_mb * 1024 * 1024
+    limit_bytes = _current_address_space_bytes() + max_memory_mb * 1024 * 1024
     try:
         _, hard = resource.getrlimit(resource.RLIMIT_AS)
         new_soft = limit_bytes if hard == resource.RLIM_INFINITY else min(limit_bytes, hard)
